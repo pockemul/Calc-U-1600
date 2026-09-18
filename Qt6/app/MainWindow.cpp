@@ -28,7 +28,14 @@
 #include <QAction>
 #include <QActionGroup>
 #include <QKeySequence>
+#include <chrono>
 #include <functional>
+
+namespace {
+// ~60 Hz. Shared by the frame timer's own period and by the turbo
+// fast-forward budget below, so the two stay in lockstep if this changes.
+constexpr int kFrameIntervalMs = 16;
+} // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     setWindowTitle(tr("Calc-U-1600"));
@@ -110,16 +117,6 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                                                             tr("Presets (*.pc1500 *.pc1500a *.pc1600);;All Files (*)"));
         if (path.isEmpty()) return;
 
-        // A preset doesn't just open a file -- it replaces the running
-        // machine (model/ROM/modules/plotter/program) with whatever the
-        // preset specifies, same destructive-to-current-state rationale as
-        // Load BASIC Program's own confirmation.
-        const auto reply = QMessageBox::question(
-            this, tr("Load Preset"),
-            tr("This replaces the current machine and its state with the one specified in the preset. Continue?"),
-            QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
-        if (reply != QMessageBox::Yes) return;
-
         runSynchronousLoad(
             tr("Load Preset"), [this, path](QString* error) { return m_presetController->loadPreset(path, error); },
             // PresetController::armed (connected above to onPresetArmed())
@@ -150,25 +147,6 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                                                             AppSettings::presetOpenDirOrHome(),
                                                             tr("BASIC Programs (*.bas);;All Files (*)"));
         if (path.isEmpty()) return;
-
-        // Step 0: tokenize before touching anything else -- a listing that
-        // doesn't even tokenize should fail here with no popup and no
-        // reset, not after the machine's already been cleared for it.
-        QString precheckError;
-        if (!m_presetController->checkBasicProgramTokenizes(path, &precheckError)) {
-            QMessageBox::warning(this, tr("Load BASIC Program"), precheckError);
-            return;
-        }
-
-        // The load choreography resets the machine and clears the resident
-        // program (see PresetController::loadBasicProgramLive) -- unlike
-        // Load Preset, this runs against a machine the user may have been
-        // actively using, so confirm first.
-        const auto reply = QMessageBox::question(
-            this, tr("Load BASIC Program"),
-            tr("This resets the machine and clears the current program before loading the new one. Continue?"),
-            QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
-        if (reply != QMessageBox::Yes) return;
 
         runSynchronousLoad(tr("Load BASIC Program"), [this, path](QString* error) {
             return m_presetController->loadBasicProgramLive(path, error);
@@ -204,11 +182,13 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             m_controller->releaseKey(key);
         }
     });
+    connect(m_faceplate->lcdWidget(), &LcdWidget::turboRequested, this,
+            [this](bool active) { m_turboActive = active; });
 
     m_frameTimer = new QTimer(this);
     m_frameTimer->setTimerType(Qt::PreciseTimer);
     connect(m_frameTimer, &QTimer::timeout, this, &MainWindow::onFrameTick);
-    m_frameTimer->start(16); // ~60 Hz
+    m_frameTimer->start(kFrameIntervalMs);
 
     // MachineController's constructor already booted whatever model the
     // "Startup device" setting picked (see AppSettings::startupModelPreference()),
@@ -259,7 +239,7 @@ void MainWindow::runSynchronousLoad(const QString& errorTitle, const std::functi
     const bool ok = loadFn(&error);
     unsetCursor();
     if (afterLoad) afterLoad();
-    m_frameTimer->start(16);
+    m_frameTimer->start(kFrameIntervalMs);
 
     if (!ok) {
         QMessageBox::warning(this, errorTitle, error);
@@ -334,13 +314,42 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
         return;
     }
 
+    // A real held press/release, tracked for the matching .up event --
+    // used for any key that bypasses the live-typing queue.
+    auto trackAndPress = [this, event](const std::string& baseKey) {
+        m_controller->pressKey(baseKey);
+        m_physicalKeysDown.insert(event->key(), baseKey);
+    };
+
+    if (isPC1600) {
+        // PC-1600 keystroke buffering is out of scope for now -- this
+        // branch is unchanged.
+        if (resolved->needsShift) {
+            // Self-contained fire-and-forget sequence -- nothing to track
+            // for the matching .up event, so release skips it too.
+            m_controller->tapShiftedKey(resolved->baseKey);
+        } else {
+            trackAndPress(resolved->baseKey);
+        }
+        event->accept();
+        return;
+    }
+
+    // PC-1500: cursor keys bypass the queue so the ROM's own confirmed
+    // real-hardware auto-repeat can engage on a genuine physical hold;
+    // everything else (including shifted keys) is queued so fast typing
+    // can't outrun the key-scan loop and lose keystrokes -- see
+    // MachineController::enqueueKey()/enqueueShiftedKey().
     if (resolved->needsShift) {
-        // Self-contained fire-and-forget sequence -- nothing to track for
-        // the matching .up event, so release skips it too.
-        m_controller->tapShiftedKey(resolved->baseKey);
+        // Self-contained: the queue owns shift's whole tap-then-base-key
+        // sequence, nothing to track for the matching .up event.
+        m_controller->enqueueShiftedKey(resolved->baseKey);
+    } else if (resolved->isPc1500RepeatKey()) {
+        trackAndPress(resolved->baseKey);
     } else {
-        m_controller->pressKey(resolved->baseKey);
-        m_physicalKeysDown.insert(event->key(), resolved->baseKey);
+        // Self-contained: the queue owns the whole press/hold/release/idle
+        // cycle, nothing to track for the matching .up event.
+        m_controller->enqueueKey(resolved->baseKey);
     }
     event->accept();
 }
@@ -363,7 +372,24 @@ void MainWindow::keyReleaseEvent(QKeyEvent* event) {
 
 void MainWindow::onFrameTick() {
     const std::uint64_t cyclesPerFrame = static_cast<std::uint64_t>(m_controller->clockHz() / 60.0);
-    m_controller->advance(cyclesPerFrame);
+    if (m_turboActive) {
+        // Press-and-hold on the LCD: run unthrottled, i.e. as many emulated
+        // cycles as the host can produce within this tick's wall-clock
+        // budget, instead of the usual real-time-paced amount. The display
+        // still only repaints once per tick (below), so this reads as a
+        // fast-forward rather than a smoother/faster-refreshing picture.
+        // processEvents() is pumped between bursts so the mouse-release
+        // event that ends turbo (and any paint/close events) isn't starved
+        // for the whole budget.
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(kFrameIntervalMs - 2);
+        do {
+            m_controller->advance(cyclesPerFrame);
+            QCoreApplication::processEvents();
+        } while (m_turboActive && std::chrono::steady_clock::now() < deadline);
+    } else {
+        m_controller->advance(cyclesPerFrame);
+    }
 
     const DisplayFrame frame = m_controller->currentDisplay();
     m_faceplate->lcdWidget()->setFrame(frame);

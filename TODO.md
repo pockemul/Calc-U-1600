@@ -21,6 +21,8 @@ obligations.
   scrolling.
 - **No way to latch Shift from the host keyboard** (tapping Shift doesn't
   produce a visible latched state in the UI).
+- **Cmd-C (Ctrl-C) doesn't work in the debug area** — copy shortcut isn't
+  reaching/being handled by the debug panel's text widget.
 - **CE-1600P / CE-150 plotter: pen colour can drift out of sync after
   OFF/ON.** Deliberately left as a known limitation. Set a colour
   (`COLOR 2`), power off/on, print again — the plotter draws in the
@@ -52,6 +54,27 @@ obligations.
   useful measurement: an LCD-free busy-loop benchmark (compute without
   drawing) in both modes, to separate CPU/pacing error from display
   timing.
+- **RAM power-up fill byte may be wrong (0xFF vs 0x00).** The codebase
+  currently fills RAM with `0xFF` at construction/reset and documents
+  this as "confirmed real hardware behavior"
+  (`Core/PC1500/PC1500Memory.cpp:26-29,48-58`,
+  `Core/CPU/LH5803/LH5803Memory.cpp:24-28`, generalized to the whole
+  PC-1500/1500A/1600 family), with the same default propagated into
+  `Core/Connector/CE163FCard.hpp` and the generic YAML memory-card
+  format's `powerUpFill` (`Core/Connector/MemoryCardDefinition.hpp:86`),
+  and cited in `docs/Memory-Card-Definition-Spec.md` /
+  `-Format.md` / `User-Guide.md`. A domain-expert check said real
+  hardware actually zeros RAM on startup, not `0xFF` — needs a proper
+  hardware verification pass. If `0x00` turns out to be correct, this is
+  a coordinated fix across those memory constructors/reset paths, the
+  card model, the generic card-definition default, ~a dozen test
+  assertions (e.g. `lh5803_tests.cpp:97`, `memory_card_tests.cpp:903`,
+  `pc1600_slot_ram_tests.cpp:50`), and the two spec/format docs — not
+  just a comment fix. Note in passing: open-bus/unmapped-address reads
+  and flash-erase-to-`0xFF` are a different mechanism and would be
+  unaffected either way; and `Core/PC1600/PC1600Memory.hpp:372,488`
+  already zero-inits the Z-80-side internal RAM bank, so the codebase is
+  already inconsistent with itself regardless of which byte is correct.
 - **`TIME`/the RTC advances at emulated-CPU rate, not wall-clock** — it
   races ahead when the emulator runs faster than real-time, since the
   clock is seeded once from the host and thereafter advanced only by
@@ -93,6 +116,13 @@ obligations.
 - CE-1600F: remaining peripheral support.
 - Research MODE 1 (LH-5803/PC-1500-compat mode): does it genuinely reuse
   the old ROM for things like `PRINT`?
+- Load a raw `.bin` (assembly) directly, without a SharpDataExchange
+  header. Pop up a dialog when disambiguation is needed: which slot when
+  more than one is available, and a start address when the header
+  (and thus the address) is missing.
+- Emulate the PC-1600F floppy drive.
+- Emulate the CE-158.
+- Allow screenshotting the display.
 
 ## Code cleanup backlog
 
