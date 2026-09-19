@@ -4,6 +4,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QSaveFile>
 
 namespace AppPaths {
@@ -49,6 +50,25 @@ QString sanitizedInstanceFileName(const QString& instanceName) {
 
 QString instancePathFor(const QString& instanceName) {
     return QDir(instanceDir()).filePath(sanitizedInstanceFileName(instanceName));
+}
+
+QString sanitizedFloppyFileName(const QString& diskName) {
+    QString s = diskName;
+    s.replace('/', '-').replace(':', '-');
+    s = s.simplified();
+    if (s.isEmpty()) s = QStringLiteral("Untitled");
+    return s + QStringLiteral(".floppy.yaml");
+}
+
+QString floppyInstancePathFor(const QString& diskName) {
+    return QDir(instanceDir()).filePath(sanitizedFloppyFileName(diskName));
+}
+
+bool isUnderDir(const QString& path, const QString& dir) {
+    if (path.isEmpty() || dir.isEmpty()) return false;
+    const QString a = QFileInfo(path).canonicalFilePath();
+    const QString b = QFileInfo(dir).canonicalFilePath();
+    return !a.isEmpty() && !b.isEmpty() && a.startsWith(b);
 }
 
 bool atomicWriteFile(const QString& path, const std::string& text) {

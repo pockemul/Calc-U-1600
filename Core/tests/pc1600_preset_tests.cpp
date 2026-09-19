@@ -15,6 +15,8 @@
 
 #include <unistd.h> // mkdtemp
 
+#include "../Connector/CE1600FCard.hpp"
+#include "../Connector/FloppyImageFile.hpp"
 #include "../PC1600/PC1600Machine.hpp"
 #include "../PC1600/PC1600PresetLoader.hpp"
 #include "PresetTestSupport.hpp"
@@ -237,6 +239,10 @@ bool writeFile(const std::string& path, const std::vector<uint8_t>& bytes) {
     if (!out) return false;
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     return static_cast<bool>(out);
+}
+
+bool writeTextFile(const std::string& path, const std::string& text) {
+    return writeFile(path, std::vector<uint8_t>(text.begin(), text.end()));
 }
 
 // Functional: a `program: format: binary` block with a PC-1600 ML header
@@ -645,6 +651,132 @@ void test_loader_no_plotter_key_attaches_nothing() {
     CHECK(!m.ce1600pAttached());
 }
 
+// `floppy:` without `plotter: ce1600p` is a parse error -- the CE-1600F
+// attaches only as a union with the CE-1600P.
+void test_parser_rejects_floppy_without_ce1600p() {
+    PresetFile p;
+    std::string err;
+    CHECK(!parse("model: PC-1600\nfloppy: mydisk\n", &p, &err));
+    CHECK(err.find("floppy") != std::string::npos);
+
+    CHECK(!parse("model: PC-1600\nplotter: ce150\nfloppy: mydisk\n", &p, &err));
+    CHECK(err.find("floppy") != std::string::npos);
+}
+
+// `floppy:` is a PC-1600-only field.
+void test_parser_rejects_floppy_on_pc1500() {
+    PresetFile p;
+    std::string err;
+    CHECK(!parse("model: PC-1500\nfirmware: A04\nfloppy: mydisk\n", &p, &err));
+    CHECK(err.find("floppy") != std::string::npos);
+}
+
+// `floppy: <name>` alongside `plotter: ce1600p` parses and round-trips
+// verbatim into PresetFile::floppy.
+void test_parser_accepts_floppy_with_ce1600p() {
+    PresetFile p;
+    std::string err;
+    CHECK(parse("model: PC-1600\nplotter: ce1600p\nfloppy: mydisk\n", &p, &err));
+    CHECK(p.floppy == "mydisk");
+    CHECK(p.floppySide == 0);
+    CHECK(p.plotter == "ce1600p");
+}
+
+// `floppy: <name>,A`/`,B` (case-insensitive) strips the side suffix into
+// floppySide and leaves floppy as the bare disk name.
+void test_parser_accepts_floppy_side_suffix() {
+    PresetFile p;
+    std::string err;
+    CHECK(parse("model: PC-1600\nplotter: ce1600p\nfloppy: mydisk,B\n", &p, &err));
+    CHECK(p.floppy == "mydisk");
+    CHECK(p.floppySide == 1);
+
+    CHECK(parse("model: PC-1600\nplotter: ce1600p\nfloppy: mydisk,a\n", &p, &err));
+    CHECK(p.floppy == "mydisk");
+    CHECK(p.floppySide == 0);
+
+    CHECK(!parse("model: PC-1600\nplotter: ce1600p\nfloppy: mydisk,Q\n", &p, &err));
+    CHECK(err.find("side") != std::string::npos);
+}
+
+// Functional: attaching CE-1600P with no `floppy:` key leaves the drive
+// empty -- the same "–empty–" default as the GUI.
+void test_loader_ce1600p_with_no_floppy_key_leaves_drive_empty() {
+    PresetFile p;
+    std::string err;
+    CHECK(parse("model: PC-1600\nplotter: ce1600p\n", &p, &err));
+
+    PC1600Machine m;
+    PC1600PresetLoadResult r = applyPC1600Preset(m, p, {}, ".", ".", {}, {"roms"});
+    if (!r.ok) {
+        std::fprintf(stderr, "SKIP test_loader_ce1600p_with_no_floppy_key_leaves_drive_empty: %s\n", r.error.c_str());
+        return;
+    }
+    CHECK(m.ce1600fAttached());
+    CHECK(r.floppyImageLabel.empty());
+    CHECK(!m.ce1600fHasDisk());
+}
+
+// Functional: `floppy: <name>` resolves the `*.floppy.yaml` declaring that
+// disk-name in `moduleDir` and loads it into the union-attached CE1600FCard.
+void test_loader_floppy_key_loads_named_disk_image() {
+    PresetFile p;
+    std::string err;
+    CHECK(parse("model: PC-1600\nplotter: ce1600p\nfloppy: mydisk\n", &p, &err));
+
+    std::vector<uint8_t> diskImage(CE1600FCard::kImageSize, 0x5A);
+    CHECK(writeTextFile("/tmp/mydisk-file.floppy.yaml", formatFloppyFile("mydisk", diskImage)));
+
+    PC1600Machine m;
+    PC1600PresetLoadResult r = applyPC1600Preset(m, p, {}, ".", "/tmp", {}, {"roms"});
+    if (!r.ok) {
+        std::fprintf(stderr, "SKIP test_loader_floppy_key_loads_named_disk_image: %s\n", r.error.c_str());
+        return;
+    }
+    CHECK(m.ce1600fAttached());
+    CHECK(r.floppyImageLabel == "mydisk");
+    CHECK(r.floppyResolvedPath == "/tmp/mydisk-file.floppy.yaml");
+    const auto image = m.ce1600fDiskImage();
+    CHECK(image.size() == CE1600FCard::kImageSize);
+    CHECK(image[0] == 0x5A);
+    CHECK(image[CE1600FCard::kImageSize - 1] == 0x5A);
+}
+
+// `floppy: <name>,B` selects side B after loading -- loadImage() itself
+// always resets to side A, so the preset loader must apply the suffix
+// after attach.
+void test_loader_floppy_key_side_suffix_selects_side_b() {
+    PresetFile p;
+    std::string err;
+    CHECK(parse("model: PC-1600\nplotter: ce1600p\nfloppy: mydiskb,B\n", &p, &err));
+
+    std::vector<uint8_t> diskImage(CE1600FCard::kImageSize, 0x33);
+    CHECK(writeTextFile("/tmp/mydiskb.floppy.yaml", formatFloppyFile("mydiskb", diskImage)));
+
+    PC1600Machine m;
+    PC1600PresetLoadResult r = applyPC1600Preset(m, p, {}, ".", "/tmp", {}, {"roms"});
+    if (!r.ok) {
+        std::fprintf(stderr, "SKIP test_loader_floppy_key_side_suffix_selects_side_b: %s\n", r.error.c_str());
+        return;
+    }
+    CHECK(m.ce1600fAttached());
+    CHECK(m.ce1600fSide() == 1);
+}
+
+// A `floppy:` name that no `*.floppy.yaml` declares is a
+// clear error, not a crash or a silent blank disk.
+void test_loader_floppy_key_missing_file_is_an_error() {
+    PresetFile p;
+    std::string err;
+    CHECK(parse("model: PC-1600\nplotter: ce1600p\nfloppy: nosuchdisk\n", &p, &err));
+
+    PC1600Machine m;
+    PC1600PresetLoadResult r = applyPC1600Preset(m, p, {}, ".", "/tmp", {}, {"roms"});
+    CHECK(!r.ok);
+    CHECK(r.error.find("nosuchdisk") != std::string::npos);
+    CHECK(!m.ce1600fAttached());
+}
+
 } // namespace
 
 int run_pc1600_preset_tests() {
@@ -672,6 +804,14 @@ int run_pc1600_preset_tests() {
     test_loader_ce150_plotter_attaches_with_rom_path();
     test_loader_ce1600p_plotter_needs_rom_path();
     test_loader_no_plotter_key_attaches_nothing();
+    test_parser_rejects_floppy_without_ce1600p();
+    test_parser_rejects_floppy_on_pc1500();
+    test_parser_accepts_floppy_with_ce1600p();
+    test_parser_accepts_floppy_side_suffix();
+    test_loader_ce1600p_with_no_floppy_key_leaves_drive_empty();
+    test_loader_floppy_key_loads_named_disk_image();
+    test_loader_floppy_key_side_suffix_selects_side_b();
+    test_loader_floppy_key_missing_file_is_an_error();
 
     std::printf("pc1600_preset_tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail;

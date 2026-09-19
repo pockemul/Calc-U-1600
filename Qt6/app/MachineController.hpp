@@ -14,12 +14,25 @@
 class PC1500Machine;
 class PC1600Machine;
 class MemoryModuleManager;
+class FloppyDiskManager;
 class PtySerialLink;
 
 namespace MachineControllerNS {
 enum class Model { PC1500, PC1500A, PC1600 };
 }
 using MachineControllerNS::Model;
+
+// The per-model settings key ("PC1500"/"PC1500A"/"PC1600") shared by
+// AppSettings::startupModelPreference() and defaultPresetPath(); lowercased,
+// it's also that model's preset file extension.
+inline QString modelSettingsKey(Model model) {
+    switch (model) {
+        case Model::PC1500: return QStringLiteral("PC1500");
+        case Model::PC1500A: return QStringLiteral("PC1500A");
+        case Model::PC1600: return QStringLiteral("PC1600");
+    }
+    return QString();
+}
 
 // One flat, model-agnostic frame the UI paints from -- deliberately wider
 // than either Core display type (PC1500Display's 156x7 + 14 named status
@@ -130,6 +143,10 @@ public:
     // switchModel() simply skips the attach callback -- harmless, since
     // no module is selected yet at cold start.
     void setModuleManager(MemoryModuleManager* mgr) { m_moduleManager = mgr; }
+    // The CE-1600F comes and goes with the CE-1600P: attachCE1600P() puts
+    // the selected disk in, and anything that removes the drive
+    // (detachCE1600P(), a PC-1600 attachCE150()) autosaves it first.
+    void setFloppyManager(FloppyDiskManager* mgr) { m_floppyManager = mgr; }
 
     // Raw access for MemoryModuleManager to call the two different attach
     // APIs and read live card state -- kept as thin pass-throughs rather
@@ -236,6 +253,8 @@ private:
     std::unique_ptr<PC1500Machine> m_pc1500;
     std::unique_ptr<PC1600Machine> m_pc1600;
     MemoryModuleManager* m_moduleManager = nullptr; // not owned
+    FloppyDiskManager* m_floppyManager = nullptr;   // not owned
+    void flushFloppyBeforeDetach();
 
     // Lazily created the first time a PC1600Machine exists, then kept alive
     // for the rest of the app's life (see attachSerialLink()) -- a stable

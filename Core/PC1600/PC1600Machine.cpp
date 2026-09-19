@@ -66,14 +66,21 @@ bool PC1600Machine::attachCE1600P(const uint8_t* rom1, size_t rom1Size,
         return false;
     auto card = std::make_unique<CE1600PCard>();
     if (!card->loadRom(rom1, rom1Size, rom2, rom2Size)) return false;
+    auto floppy = std::make_unique<CE1600FCard>();  // drive starts empty
     detachCE1600P();
     detachCE150(); // one plotter on the bus at a time
     m_z80Mem.ce1600pBus().attach(card.get());
+    m_z80Mem.ce1600pBus().attach(floppy.get());
     m_ce1600pCard = std::move(card);
+    m_ce1600fCard = std::move(floppy);
     return true;
 }
 
 void PC1600Machine::detachCE1600P() {
+    if (m_ce1600fCard) {
+        m_z80Mem.ce1600pBus().detach(m_ce1600fCard.get());
+        m_ce1600fCard.reset();
+    }
     if (!m_ce1600pCard) return;
     m_z80Mem.ce1600pBus().detach(m_ce1600pCard.get());
     m_ce1600pCard.reset();
@@ -105,6 +112,50 @@ std::vector<std::string> PC1600Machine::drainCE1600PEvents() {
 void PC1600Machine::clearCE1600PPaper() {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_ce1600pCard) m_ce1600pCard->mechanism().clearPaper();
+}
+
+// ── CE-1600F floppy (union-attached with CE-1600P, above) ─────────────
+
+std::vector<uint8_t> PC1600Machine::ce1600fDiskImage() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_ce1600fCard) return {};
+    return m_ce1600fCard->imageForSave();
+}
+
+uint64_t PC1600Machine::ce1600fRevision() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_ce1600fCard ? m_ce1600fCard->revision() : 0;
+}
+
+void PC1600Machine::ce1600fEject() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_ce1600fCard) m_ce1600fCard->ejectDisk();
+}
+
+bool PC1600Machine::ce1600fHasDisk() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_ce1600fCard && m_ce1600fCard->hasDisk();
+}
+
+bool PC1600Machine::ce1600fLoadImage(const uint8_t* data, size_t size) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_ce1600fCard) return false;
+    return m_ce1600fCard->loadImage(data, size);
+}
+
+int PC1600Machine::ce1600fSide() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_ce1600fCard ? m_ce1600fCard->side() : 0;
+}
+
+void PC1600Machine::ce1600fSetSide(int side) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_ce1600fCard) m_ce1600fCard->setSide(side);
+}
+
+bool PC1600Machine::ce1600fMotorOn() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_ce1600fCard && m_ce1600fCard->motorOn();
 }
 
 // ── CE-150 plotter (LH5803 side) ──────────────────────────────────────
@@ -209,6 +260,7 @@ int PC1600Machine::step() {
         // polls observe them in.
         m_z80Mem.uart().tick(cost);
         m_z80Mem.subCpu().tickByTStates(cost);
+        if (m_ce1600fCard) m_ce1600fCard->advance(static_cast<uint32_t>(cost));
         // The documented handoff is OUT (38H),A then HALT -- the write
         // sets the pending flag (PC1600Memory::writeIO), but the actual
         // switch only happens once the SC7852 has also reached HALT, so
@@ -283,9 +335,27 @@ uint64_t PC1600Machine::runCycles(uint64_t maxCycles) {
         // window m_rtcAccum's LH5803 branch (see step()) exists to cover.
         const uint64_t cycles = static_cast<uint64_t>(
             c > 0 ? c : (z80Owns ? SC7852::kHaltTickCycles : LH5801::kHaltTickCycles));
-        consumed += toTStates(cycles, z80Owns);
+        const uint64_t tstates = toTStates(cycles, z80Owns);
+        consumed += tstates;
+        // See setYieldHook(). step() takes m_mutex per call, so it isn't
+        // held here.
+        if (m_yieldHook) {
+            if (tstates >= m_yieldCountdown) {
+                m_yieldCountdown = m_yieldInterval;
+                m_yieldHook();
+            } else {
+                m_yieldCountdown -= tstates;
+            }
+        }
     }
     return consumed;
+}
+
+void PC1600Machine::setYieldHook(std::function<void()> hook, uint64_t intervalTStates) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_yieldHook = std::move(hook);
+    m_yieldInterval = intervalTStates;
+    m_yieldCountdown = intervalTStates;
 }
 
 void PC1600Machine::pressKey(const std::string& name) {

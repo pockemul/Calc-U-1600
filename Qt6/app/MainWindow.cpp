@@ -5,6 +5,7 @@
 #include "DebugPanel.hpp"
 #include "MachineController.hpp"
 #include "MemoryModuleManager.hpp"
+#include "FloppyDiskManager.hpp"
 #include "PC1500KeyboardMap.hpp"
 #include "PlotterController.hpp"
 #include "PlotterPaperWidget.hpp"
@@ -16,6 +17,8 @@
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QTimer>
+#include <QElapsedTimer>
+#include <QProgressDialog>
 #include <QKeyEvent>
 #include <QCloseEvent>
 #include <QInputDialog>
@@ -35,6 +38,12 @@ namespace {
 // ~60 Hz. Shared by the frame timer's own period and by the turbo
 // fast-forward budget below, so the two stay in lockstep if this changes.
 constexpr int kFrameIntervalMs = 16;
+
+// runSynchronousLoad(): how often the blocked UI thread pumps its event
+// loop mid-load, and how long a load must run before the "Loading..."
+// popup appears (short loads finish without flashing it).
+constexpr int kLoadPumpIntervalMs = 30;
+constexpr int kLoadPopupDelayMs = 500;
 } // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
@@ -44,7 +53,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     m_controller = std::make_unique<MachineController>(this);
     m_moduleManager = std::make_unique<MemoryModuleManager>(m_controller.get(), this);
     m_controller->setModuleManager(m_moduleManager.get());
-    m_presetController = std::make_unique<PresetController>(m_controller.get(), m_moduleManager.get(), this);
+    m_floppyManager = std::make_unique<FloppyDiskManager>(m_controller.get(), this);
+    m_controller->setFloppyManager(m_floppyManager.get());
+    m_presetController = std::make_unique<PresetController>(m_controller.get(), m_moduleManager.get(),
+                                                             m_floppyManager.get(), this);
 
     // QMainWindow requires exactly one central widget -- everything that
     // used to be added straight into `this`'s own QVBoxLayout now lives in
@@ -93,11 +105,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         refreshModuleCombos();
     });
     connect(m_controlBar, &ControlBar::nameAndSaveRequested, this, [this](int slot) {
-        const bool prefillCurrent = m_moduleManager->slotHasInstanceFile(slot);
         bool ok = false;
-        const QString name = QInputDialog::getText(
-            this, tr("Name & Save"), tr("Instance name:"), QLineEdit::Normal,
-            prefillCurrent ? m_moduleManager->selectedModuleName(slot) : QString(), &ok);
+        const QString name = QInputDialog::getText(this, tr("Name & Save"), tr("Instance name:"),
+                                                   QLineEdit::Normal, QString(), &ok);
         if (!ok) return;
         QString error;
         if (!m_moduleManager->nameAndSave(slot, name, &error)) {
@@ -130,7 +140,6 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             // underlying machine either way.
             [this] { onPresetArmed(); });
     };
-    connect(m_controlBar, &ControlBar::openPresetRequested, this, openPresetDialog);
     // File/Help menu actions reuse the exact same handlers as their
     // ControlBar equivalents -- see buildMenuBar()'s own doc comment.
     connect(m_openPresetAction, &QAction::triggered, this, openPresetDialog);
@@ -154,6 +163,28 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     });
     connect(m_moduleManager.get(), &MemoryModuleManager::errorMessage, this,
             [this](const QString& text) { QMessageBox::warning(this, tr("Memory Module"), text); });
+    connect(m_controlBar, &ControlBar::floppyDiskSelected, this, [this](QString diskNameOrEmpty) {
+        m_floppyManager->selectDisk(diskNameOrEmpty);
+        refreshFloppyCombo();
+    });
+    connect(m_controlBar, &ControlBar::floppySideToggleRequested, this, [this] {
+        m_floppyManager->toggleSide();
+        m_controlBar->setFloppySide(m_floppyManager->side());
+    });
+    connect(m_controlBar, &ControlBar::floppyNameAndSaveRequested, this, [this] {
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, tr("Name & Save"), tr("Disk name:"),
+                                                   QLineEdit::Normal, QString(), &ok);
+        if (!ok) return;
+        QString error;
+        if (!m_floppyManager->nameAndSave(name, &error)) {
+            QMessageBox::warning(this, tr("Name & Save"), error);
+            return;
+        }
+        refreshFloppyCombo();
+    });
+    connect(m_floppyManager.get(), &FloppyDiskManager::errorMessage, this,
+            [this](const QString& text) { QMessageBox::warning(this, tr("Floppy Disk"), text); });
     connect(m_controlBar, &ControlBar::ce150ToggleRequested, this,
             [this] { m_plotterController->requestToggleCE150(); });
     connect(m_controlBar, &ControlBar::ce1600pToggleRequested, this,
@@ -205,6 +236,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     resize(AppSettings::windowSize());
     setFocus();
+
+    // Starting up selects the startup model too -- apply its default preset
+    // once the event loop runs, so the window is already up while a preset
+    // with long `wait:` steps plays out.
+    QTimer::singleShot(0, this, [this] { applyDefaultPreset(m_controller->currentModel()); });
 }
 
 MainWindow::~MainWindow() = default;
@@ -212,6 +248,7 @@ MainWindow::~MainWindow() = default;
 void MainWindow::closeEvent(QCloseEvent* event) {
     AppSettings::setWindowSize(size());
     m_moduleManager->flushPendingPersist();
+    m_floppyManager->flushPendingPersist();
     QMainWindow::closeEvent(event);
 }
 
@@ -219,6 +256,12 @@ void MainWindow::syncControlBarForModel() {
     const bool isPC1600 = m_controller->currentModel() == Model::PC1600;
     m_controlBar->setSlot2Visible(isPC1600);
     m_controlBar->setCe1600pVisible(isPC1600);
+    // Always shown on a PC-1600 (never hidden alongside the CE-1600P
+    // toggle) so the control bar doesn't jump around as the plotter/
+    // floppy union attaches and detaches -- onPlotterAttachedChanged()
+    // grays the row out instead via setFloppyEnabled().
+    m_controlBar->setFloppyVisible(isPC1600);
+    if (isPC1600) refreshFloppyCombo();
     // PC-1500A is A04-only (PC1500Variant.hpp), so the picker is only worth
     // showing for the plain PC-1500.
     const bool romPickerVisible = m_controller->currentModel() == Model::PC1500;
@@ -234,9 +277,40 @@ void MainWindow::runSynchronousLoad(const QString& errorTitle, const std::functi
     // loader is mid-script.
     m_frameTimer->stop();
     m_moduleManager->flushPendingPersist();
+    m_floppyManager->flushPendingPersist();
     setCursor(Qt::WaitCursor);
+
+    // The load itself blocks this thread, so pump the event loop from the
+    // machine's yield hook (see PresetController::setYieldHook()): keeps the
+    // window painting (no beachball) and, once the load has run long enough
+    // to be noticeable, shows a "Loading..." popup. User input stays
+    // excluded -- nothing may touch the machine until the load returns.
+    QElapsedTimer sinceStart;
+    QElapsedTimer sincePump;
+    sinceStart.start();
+    sincePump.start();
+    std::unique_ptr<QProgressDialog> popup;
+    m_presetController->setYieldHook([&] {
+        if (sincePump.elapsed() < kLoadPumpIntervalMs) return;
+        sincePump.restart();
+        if (!popup && sinceStart.elapsed() >= kLoadPopupDelayMs) {
+            popup = std::make_unique<QProgressDialog>(tr("Loading…"), QString(), 0, 0, this);
+            popup->setWindowTitle(errorTitle);
+            popup->setWindowModality(Qt::WindowModal);
+            popup->setMinimumDuration(0);
+            popup->show();
+        }
+        // Let the LCD follow along too (the frame timer that normally
+        // refreshes it is stopped for the load).
+        m_faceplate->lcdWidget()->setFrame(m_controller->currentDisplay());
+        m_faceplate->lcdWidget()->update();
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    });
+
     QString error;
     const bool ok = loadFn(&error);
+    m_presetController->setYieldHook({});
+    popup.reset();
     unsetCursor();
     if (afterLoad) afterLoad();
     m_frameTimer->start(kFrameIntervalMs);
@@ -252,6 +326,14 @@ void MainWindow::onPlotterAttachedChanged(bool isCE150, bool attached) {
     m_controlBar->setCe150State(ce150Attached, !ce1600pAttached);
     m_controlBar->setCe1600pState(ce1600pAttached, !ce150Attached);
     const bool otherAttached = isCE150 ? ce1600pAttached : ce150Attached;
+    if (!isCE150) {
+        // CE-1600F attaches as a union with CE-1600P (PC1600Machine::
+        // attachCE1600P()); whoever attached it (PlotterController or a
+        // preset) already put its disk in. Gray the picker in/out alongside
+        // it (it stays visible either way -- see syncControlBarForModel()).
+        m_controlBar->setFloppyEnabled(attached);
+        refreshFloppyCombo();
+    }
     if (attached) {
         m_plotterPaper->setKind(isCE150 ? PlotterPaperWidget::Kind::CE150 : PlotterPaperWidget::Kind::CE1600P);
         if (!m_plotterPaperInLayout) { m_debugRowLayout->addWidget(m_plotterPaper, 1); m_plotterPaperInLayout = true; }
@@ -293,8 +375,15 @@ void MainWindow::refreshModuleCombos() {
         const auto bundled = m_moduleManager->bundledEntries(host);
         const auto instance = m_moduleManager->instanceEntries(host);
         m_controlBar->setModuleCombos(slot, bundled, instance, m_moduleManager->selectedModuleName(slot));
-        m_controlBar->setSlotBatteryBacked(slot, m_moduleManager->isSlotBatteryBacked(slot, bundled, instance));
+        m_controlBar->setSlotSaveEnabled(slot, m_moduleManager->canNameAndSave(slot, bundled, instance));
     }
+}
+
+void MainWindow::refreshFloppyCombo() {
+    m_controlBar->setFloppyCombo(m_floppyManager->bundledEntries(), m_floppyManager->instanceEntries(),
+                                 m_floppyManager->selectedDiskName());
+    m_controlBar->setFloppySide(m_floppyManager->side());
+    m_controlBar->setFloppySaveEnabled(m_floppyManager->canNameAndSave());
 }
 
 void MainWindow::keyPressEvent(QKeyEvent* event) {
@@ -396,6 +485,8 @@ void MainWindow::onFrameTick() {
     m_faceplate->lcdWidget()->update();
 
     m_moduleManager->markDirtyAndSchedulePersist();
+    m_floppyManager->markDirtyAndSchedulePersist();
+    m_controlBar->setFloppyMotorOn(m_floppyManager->motorOn());
     m_debugPanel->onFrameTick();
     m_plotterController->onFrameTick();
     if (m_plotterPaperInLayout) m_plotterPaper->onFrameTick();
@@ -467,7 +558,8 @@ void MainWindow::buildMenuBar() {
 
 void MainWindow::applyModelSelection(Model model) {
     m_moduleManager->flushPendingPersist();
-    m_moduleManager->onModelChanged(model);
+    m_floppyManager->flushPendingPersist();
+    m_moduleManager->onModelChanged();
     m_controller->switchModel(model); // rebuilds the machine -- any live plotter attachment is already gone
     m_plotterController->resetOnModelSwitch();
     m_faceplate->setModel(model);
@@ -477,10 +569,21 @@ void MainWindow::applyModelSelection(Model model) {
     syncMachineMenuFromModel(model);
     syncMachineMenuFromRomRevision(m_controller->pc1500RomRevision());
     refreshModuleCombos();
+    applyDefaultPreset(model);
+}
+
+void MainWindow::applyDefaultPreset(Model model) {
+    const QString path = AppSettings::defaultPresetPath(modelSettingsKey(model));
+    if (path.isEmpty()) return;
+    runSynchronousLoad(
+        tr("Default Preset"),
+        [this, path, model](QString* error) { return m_presetController->loadDefaultPreset(path, model, error); },
+        [this] { onPresetArmed(); });
 }
 
 void MainWindow::applyRomRevisionSelection(PC1500RomRevision revision) {
     m_moduleManager->flushPendingPersist();
+    m_floppyManager->flushPendingPersist();
     m_controller->setPC1500RomRevision(revision); // rebuilds the machine
     m_controlBar->setRomRevision(revision);
     syncMachineMenuFromRomRevision(revision);

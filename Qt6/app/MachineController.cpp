@@ -13,6 +13,7 @@
 #include "Resources/BundledRomCatalog.hpp"
 #include "AppPaths.hpp"
 #include "AppSettings.hpp"
+#include "FloppyDiskManager.hpp"
 #include "MemoryModuleManager.hpp"
 
 namespace {
@@ -30,9 +31,9 @@ const char* pc1500RomVariantName(PC1500RomRevision revision) {
 // a pinned model, or ("last", the default) whatever was last switched to.
 Model initialModel() {
     const QString pref = AppSettings::startupModelPreference();
-    if (pref == QLatin1String("PC1500")) return Model::PC1500;
-    if (pref == QLatin1String("PC1500A")) return Model::PC1500A;
-    if (pref == QLatin1String("PC1600")) return Model::PC1600;
+    for (Model m : {Model::PC1500, Model::PC1500A, Model::PC1600}) {
+        if (pref == modelSettingsKey(m)) return m;
+    }
     return static_cast<Model>(AppSettings::lastUsedModel());
 }
 
@@ -424,9 +425,16 @@ std::uint32_t MachineController::drainLH5803Trace(CpuFrame* out, std::uint32_t m
 
 // ---- Plotter support ----
 
+void MachineController::flushFloppyBeforeDetach() {
+    if (m_floppyManager && ce1600pAttached()) m_floppyManager->flushPendingPersist();
+}
+
 bool MachineController::attachCE150() {
     std::string err;
-    if (m_pc1600) return BundledRoms::attachCE150(*m_pc1600, bundledRomDirs(), &err);
+    if (m_pc1600) {
+        flushFloppyBeforeDetach();  // Core detaches the CE-1600P/F to make room
+        return BundledRoms::attachCE150(*m_pc1600, bundledRomDirs(), &err);
+    }
     if (m_pc1500) return BundledRoms::attachCE150(*m_pc1500, bundledRomDirs(), &err);
     return false;
 }
@@ -445,11 +453,15 @@ bool MachineController::ce150Attached() const {
 bool MachineController::attachCE1600P() {
     if (!m_pc1600) return false;
     std::string err;
-    return BundledRoms::attachCE1600P(*m_pc1600, bundledRomDirs(), &err);
+    if (!BundledRoms::attachCE1600P(*m_pc1600, bundledRomDirs(), &err)) return false;
+    if (m_floppyManager) m_floppyManager->insertSelectedDisk();
+    return true;
 }
 
 void MachineController::detachCE1600P() {
-    if (m_pc1600) m_pc1600->detachCE1600P();
+    if (!m_pc1600) return;
+    flushFloppyBeforeDetach();
+    m_pc1600->detachCE1600P();
 }
 
 bool MachineController::ce1600pAttached() const {

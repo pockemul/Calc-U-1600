@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "../Connector/FloppyImageFile.hpp"
 #include "../Connector/MemoryCardCatalog.hpp"
 #include "../Connector/SlotModuleFactory.hpp"
 #include "../Connector/SoftwareDefinedCard.hpp"
@@ -259,19 +260,40 @@ bool loadMachineBinary(PC1600Machine& machine, const PresetProgram& program, int
 }
 
 // Attach the plotter the preset's `plotter:` asks for, before the cold
-// boot below so the boot ROM detects it. Returns false with result->error
+// boot below so the boot ROM detects it -- and, if `floppy:` named a saved
+// CE-1600F disk, resolve it by disk-name and load it into the union-attached
+// CE1600FCard (read and validated before attaching, so a bad file leaves no
+// plotter behind). `moduleDirs` is the same bundled-then-save-folder list
+// `- modulespec:` resolution searches. Returns false with result->error
 // set on any problem.
-bool attachPresetPlotter(PC1600Machine& machine, const std::string& plotter,
-                         const std::vector<std::string>& romDirs,
-                         const PC1600PresetLogFn& log, PC1600PresetLoadResult* result) {
+bool attachPresetPlotter(PC1600Machine& machine, const std::string& plotter, const std::string& floppy,
+                         int floppySide, const std::vector<std::string>& romDirs,
+                         const std::vector<std::string>& moduleDirs, const PC1600PresetLogFn& log,
+                         PC1600PresetLoadResult* result) {
     if (plotter.empty()) return true;
-    if (!BundledRoms::attachPlotterByName(machine, plotter, romDirs, &result->error,
-                                          &result->ce150Attached)) {
+
+    FloppyFile disk;
+    if (!floppy.empty()) {
+        std::string path, err;
+        if (!resolveFloppyByName(moduleDirs, floppy, &path, &err) || !readFloppyFile(path, &disk, &err)) {
+            result->error = "floppy: " + err;
+            return false;
+        }
+        result->floppyImageLabel = floppy;
+        result->floppyResolvedPath = path;
+    }
+
+    if (!BundledRoms::attachPlotterByName(machine, plotter, romDirs, &result->error, &result->ce150Attached)) {
         return false;
+    }
+    if (!floppy.empty()) {
+        machine.ce1600fLoadImage(disk.image.data(), disk.image.size());  // resets to side A
+        if (floppySide != 0) machine.ce1600fSetSide(floppySide);
     }
     if (log) {
         log(plotter == "ce150" ? "plotter: CE-150 attached (LH5803 side)"
-                                : "plotter: " + plotter + " attached");
+                                : "plotter: " + plotter + " attached" +
+                                      (floppy.empty() ? "" : " (floppy: " + floppy + ")"));
     }
     return true;
 }
@@ -354,7 +376,8 @@ PC1600PresetLoadResult applyPC1600Preset(PC1600Machine& machine, const PresetFil
     // Plotter (`plotter:`) -- attach before the reset below, so the boot
     // ROM's peripheral scan sees it (mirrors real hardware: power off,
     // connect, power on).
-    if (!attachPresetPlotter(machine, preset.plotter, romDirs, log, &result))
+    if (!attachPresetPlotter(machine, preset.plotter, preset.floppy, preset.floppySide, romDirs, moduleDirs,
+                              log, &result))
         return result;
 
     // Machine is now fully armed (model/cards/plotter wired) but still
@@ -383,6 +406,12 @@ PC1600PresetLoadResult applyPC1600Preset(PC1600Machine& machine, const PresetFil
     for (const PresetSection& section : preset.sections) {
         sectionNo++;
         if (section.kind == PresetSection::Kind::Program) {
+            // A preceding `type:` step returns right after its ENTER, so a
+            // command it started (e.g. a SAVE) may still be running -- let it
+            // finish before this section pokes a program into memory
+            // underneath it.
+            constexpr uint64_t kProgramIdleCap = static_cast<uint64_t>(kTStateHz) * 3600;  // 1 h emulated
+            waitUntilBasicIdle(machine, kProgramIdleCap);
             const PresetProgram& program = section.program;
             if (program.format == PresetProgram::Format::BasicBinary) {
                 basic::BasicProgramSource src =

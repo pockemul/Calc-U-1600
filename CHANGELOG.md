@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.3.0] - 2026-09-19
+
+- **PC-1600F** Added the CE-1600F pocket floppy drive for the
+  PC-1600. It attaches with the CE-1600P plotter/printer (no separate
+  switch) and works like the real one: `INIT"X:"` formats a blank disk,
+  and `SAVE`, `LOAD`, `FILES` and `DSKF` work on it. Disks are
+  double-sided (64 KB per side); a control-bar button flips the disk to
+  the other side, a green lamp shows when the drive motor runs, and
+  drive timing follows the Service Manual.
+- **Floppy disk** Two templates are available: A formatted floppy,
+  and a blank one. Select one in the drop down to insert into the
+  drive. Any changes you make on these templates are in-memory only.
+  If you want to persist, click the "save" button and give the floppy
+  a name.
+- **Presets** Settings has a default preset per model (PC-1500,
+  PC-1500A, PC-1600), applied at startup and whenever that model is
+  selected. Ready-made ones are in `examples/startup/`; the PC-1600 one
+  adds a CE-1600M and CE-1601M, mounts a floppy, sets up the RAM
+  disk and COM1.
+- **Loading** Long preset loads show a "Loading…" popup and the window
+  keeps updating, instead of freezing.
+- **Settings** The Settings dialog is reorganized into titled sections
+  (General, Default presets, Storage, Tracing, Serial port).
+- **Control bar** Common controls (Reset, Settings, model/ROM, memory
+  slots) stay left-aligned, so switching models no longer shifts them.
+  The redundant "Load Preset…" button is gone; use the File menu.
+- **Build** Windows ARM64 is now built natively and gains BASIC preset
+  loading; BASIC tokenizer updated to SharpDataExchange 0.2.1.
+
 ## [0.2.0] - 2026-09-18
 
 - **Platforms** Added a native Windows ARM64 build, alongside the

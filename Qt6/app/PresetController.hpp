@@ -1,9 +1,14 @@
 #pragma once
 #include <QObject>
 #include <QString>
+#include <functional>
+
+#include "MachineController.hpp"  // Model
 
 class MachineController;
 class MemoryModuleManager;
+class FloppyDiskManager;
+struct PresetFile;
 
 // Orchestrates opening a preset file end to end (Core/PC1500/
 // PresetFile.hpp, PC1500PresetLoader.cpp / PC1600PresetLoader.cpp): parses
@@ -12,11 +17,11 @@ class MemoryModuleManager;
 // finishPresetLoad), applies it, then syncs MemoryModuleManager's slot
 // bookkeeping to match what the preset itself attached.
 //
-// Runs synchronously on the calling (UI) thread -- there's no threading
-// infrastructure here, so a preset with long `wait:` steps will visibly
-// freeze the window for its duration. MainWindow stops the frame timer
-// around the call so it can't reenter the machine mid-load; that's the
-// whole mitigation for now.
+// Runs synchronously on the calling (UI) thread. MainWindow stops the frame
+// timer around the call so it can't reenter the machine mid-load, and
+// installs a yield hook (setYieldHook()) that the machine calls
+// periodically from inside its run loop, so the window keeps repainting
+// and can show a "Loading..." popup instead of freezing.
 //
 // Only meaningful when CALCU1600_PRESET_LOADER_AVAILABLE is defined
 // (macOS for now -- see Qt6/CMakeLists.txt's CORE_SOURCES if(APPLE) block:
@@ -27,7 +32,8 @@ class MemoryModuleManager;
 class PresetController : public QObject {
     Q_OBJECT
 public:
-    PresetController(MachineController* controller, MemoryModuleManager* moduleManager, QObject* parent = nullptr);
+    PresetController(MachineController* controller, MemoryModuleManager* moduleManager,
+                     FloppyDiskManager* floppyManager, QObject* parent = nullptr);
 
     // Loads the preset at `path`. On success (or a failure partway through
     // the preset's own keys:/program: steps -- see PresetLoadResult's
@@ -37,6 +43,12 @@ public:
     // user-facing message on failure (parse error, unsupported ROM
     // revision, a missing/rejected sibling file, etc).
     bool loadPreset(const QString& path, QString* error);
+
+    // A model's default preset (AppSettings::defaultPresetPath()): same as
+    // loadPreset(), but refuses -- touching nothing -- a preset that targets
+    // a different model than `model`, so a misconfigured default can't
+    // silently switch the user to another machine.
+    bool loadDefaultPreset(const QString& path, Model model, QString* error);
 
     // Loads a plain `.bas` listing directly into the *currently running*
     // machine -- no preset wrapper, no model/ROM/module rebuild (only a
@@ -48,6 +60,12 @@ public:
     // thread, same caller contract as loadPreset() (stop the frame timer
     // first). Resets the machine and destroys the current program (NEW0).
     bool loadBasicProgramLive(const QString& path, QString* error);
+
+    // Callback installed on the target machine (PC1500Machine/
+    // PC1600Machine::setYieldHook()) for the duration of each load above,
+    // then removed again. Called on the calling thread roughly every few
+    // ms of emulated time; it must not drive the machine. Empty = none.
+    void setYieldHook(std::function<void()> hook) { m_yieldHook = std::move(hook); }
 
 signals:
     // Fired exactly once per loadPreset() call that gets far enough to
@@ -62,6 +80,11 @@ signals:
     void armed();
 
 private:
+    // Shared tail of loadPreset()/loadDefaultPreset() once the file parsed.
+    bool runPreset(const PresetFile& preset, QString* error);
+
     MachineController* m_controller;       // not owned
     MemoryModuleManager* m_moduleManager;  // not owned
+    FloppyDiskManager* m_floppyManager;    // not owned
+    std::function<void()> m_yieldHook;
 };

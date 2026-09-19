@@ -39,6 +39,16 @@ QString sanitizedInstanceFileName(const QString& instanceName);
 // The full path a fresh save under `instanceName` should write to.
 QString instancePathFor(const QString& instanceName);
 
+// Same as sanitizedInstanceFileName()/instancePathFor(), but for CE-1600F
+// floppy disks: "<name>.floppy.yaml" (Connector/FloppyImageFile.hpp)
+// instead of "<name>.card.yaml".
+QString sanitizedFloppyFileName(const QString& diskName);
+QString floppyInstancePathFor(const QString& diskName);
+
+// True if `path` resolves to somewhere inside `dir` (both canonicalized;
+// false if either doesn't exist).
+bool isUnderDir(const QString& path, const QString& dir);
+
 // Atomic write via QSaveFile (writes to a temp file beside `path` and
 // renames on commit).
 bool atomicWriteFile(const QString& path, const std::string& text);

@@ -4,6 +4,9 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QSet>
+
+#include <algorithm>
 
 #include "Connector/BatteryCardInstance.hpp"
 #include "Connector/MemoryCardCatalog.hpp"
@@ -24,13 +27,6 @@ QVector<MemoryModuleManager::ModuleEntry> entriesFor(const QString& dir, CardHos
     return out;
 }
 
-bool pathIsUnderDir(const QString& path, const QString& dir) {
-    if (path.isEmpty() || dir.isEmpty()) return false;
-    const QString a = QFileInfo(path).canonicalFilePath();
-    const QString b = QFileInfo(dir).canonicalFilePath();
-    return !a.isEmpty() && !b.isEmpty() && a.startsWith(b);
-}
-
 }  // namespace
 
 MemoryModuleManager::MemoryModuleManager(MachineController* controller, QObject* parent)
@@ -47,21 +43,19 @@ CardHost MemoryModuleManager::hostForModel(int slot, Model model) {
     return model == Model::PC1500A ? CardHost::PC1500A : CardHost::PC1500;
 }
 
-bool MemoryModuleManager::moduleCompatible(int slot, Model model, const QString& moduleName) const {
-    const CardHost host = hostForModel(slot, model);
-    for (const auto& e : bundledEntries(host))
-        if (e.moduleName == moduleName) return true;
-    for (const auto& e : instanceEntries(host))
-        if (e.moduleName == moduleName) return true;
-    return false;
-}
-
 QVector<MemoryModuleManager::ModuleEntry> MemoryModuleManager::bundledEntries(CardHost host) const {
     return entriesFor(AppPaths::bundledResourcesDir(), host);
 }
 
+// Leaves out saved cards that share a bundled card's name (any host):
+// lookup is bundled-first, so they could never be loaded.
 QVector<MemoryModuleManager::ModuleEntry> MemoryModuleManager::instanceEntries(CardHost host) const {
-    return entriesFor(AppPaths::instanceDir(), host);
+    QVector<ModuleEntry> out = entriesFor(AppPaths::instanceDir(), host);
+    const QSet<QString> bundled = bundledNames();
+    out.erase(std::remove_if(out.begin(), out.end(),
+                             [&](const ModuleEntry& e) { return bundled.contains(e.moduleName); }),
+              out.end());
+    return out;
 }
 
 void MemoryModuleManager::selectModule(int slot, const QString& moduleNameOrEmpty) {
@@ -106,7 +100,7 @@ void MemoryModuleManager::attachOneSlot(int slotIndex, CardHost host, AttachFn a
         auto card = makeSoftwareDefinedCard(path, host, &err, &moduleName);
         if (card) {
             const QString resolvedPath = QString::fromStdString(path);
-            st.instanceFilePath = pathIsUnderDir(resolvedPath, instDir) ? resolvedPath : QString();
+            st.instanceFilePath = AppPaths::isUnderDir(resolvedPath, instDir) ? resolvedPath : QString();
             attach(std::move(card));
             return;
         }
@@ -144,7 +138,7 @@ void MemoryModuleManager::syncFromPresetLoad(int slot, const QString& labelOrEmp
     const int idx = slot - 1;
     m_slots[idx].moduleName = labelOrEmpty;
     m_slots[idx].instanceFilePath =
-        pathIsUnderDir(resolvedPathOrEmpty, AppPaths::instanceDir()) ? resolvedPathOrEmpty : QString();
+        AppPaths::isUnderDir(resolvedPathOrEmpty, AppPaths::instanceDir()) ? resolvedPathOrEmpty : QString();
     m_slots[idx].persistPending = false;
     emit moduleChanged(slot);
 }
@@ -173,6 +167,13 @@ bool MemoryModuleManager::currentSlotImage(int slot, int* bankCount, std::vector
         return !image->empty();
     }
     return false;
+}
+
+QSet<QString> MemoryModuleManager::bundledNames() const {
+    QSet<QString> names;
+    for (const auto& e : scanMemoryCardDirectory(AppPaths::bundledResourcesDir().toStdString(), nullptr))
+        names.insert(QString::fromStdString(e.moduleName));
+    return names;
 }
 
 bool MemoryModuleManager::nameCollides(const QString& instanceName) const {
@@ -222,21 +223,30 @@ bool MemoryModuleManager::nameAndSave(int slot, const QString& instanceName, QSt
         *error = tr("No module attached.");
         return false;
     }
-    if (name != st.moduleName && nameCollides(name)) {
+    if (!st.instanceFilePath.isEmpty()) {
+        *error = tr("\"%1\" is already saved; changes are saved automatically.").arg(st.moduleName);
+        return false;
+    }
+    if (name.contains(QLatin1Char('"'))) {
+        *error = tr("Name cannot contain '\"'.");
+        return false;
+    }
+    if (bundledNames().contains(name)) {
+        *error = tr("\"%1\" is a built-in card name. Choose a different name.").arg(name);
+        return false;
+    }
+    if (nameCollides(name)) {
         *error = tr("A card named \"%1\" already exists. Choose a different name.").arg(name);
         return false;
     }
 
-    QString sourcePath = st.instanceFilePath;
-    if (sourcePath.isEmpty()) {
-        std::string p, err2;
-        if (!resolveModuleSpecByName(AppPaths::bundledResourcesDir().toStdString(), st.moduleName.toStdString(),
-                                     &p, &err2)) {
-            *error = tr("Couldn't find the source template for \"%1\".").arg(st.moduleName);
-            return false;
-        }
-        sourcePath = QString::fromStdString(p);
+    std::string p;
+    if (!resolveModuleSpecByName(AppPaths::bundledResourcesDir().toStdString(), st.moduleName.toStdString(), &p,
+                                 nullptr)) {
+        *error = tr("Couldn't find the source template for \"%1\".").arg(st.moduleName);
+        return false;
     }
+    const QString sourcePath = QString::fromStdString(p);
 
     std::string spliced;
     if (!spliceCardImageInto(slot, sourcePath, st.moduleName, name, &spliced, error)) return false;
@@ -285,14 +295,9 @@ void MemoryModuleManager::flushPendingPersist() {
     }
 }
 
-void MemoryModuleManager::onModelChanged(Model model) {
-    if (!m_slots[0].moduleName.isEmpty() && !moduleCompatible(1, model, m_slots[0].moduleName)) {
-        if (m_slots[0].persistPending) writeInstance(1);
-        m_slots[0] = SlotState{};
+void MemoryModuleManager::onModelChanged() {
+    for (int i = 0; i < 2; ++i) {
+        if (m_slots[i].persistPending) writeInstance(i + 1);
+        m_slots[i] = SlotState{};
     }
-
-    if (model == Model::PC1600) return;
-    if (m_slots[1].moduleName.isEmpty() && !m_slots[1].persistPending) return;
-    if (m_slots[1].persistPending) writeInstance(2);
-    m_slots[1] = SlotState{};
 }
