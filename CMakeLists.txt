@@ -6,11 +6,11 @@ cmake_minimum_required(VERSION 3.21)
 # CTest target. Opening the repo root in CLion (or any CMake-aware IDE)
 # therefore gives run/debug configurations for all of them -- see the
 # shared ones in .run/ and the "CLion / IDE Integration" section of
-# docs/Building.md.
+# docs/developer/Building.md.
 #
 # This is NOT the release entry point. Qt6/CMakeLists.txt stays the
-# authoritative app build: build_and_run.sh, docs/Building.md's per-platform
-# recipes and every packaging job in .github/workflows/build.yml configure
+# authoritative app build: build_and_run.sh,
+# docs/developer/Building.md's per-platform recipes and every packaging job in .github/workflows/build.yml configure
 # `-S Qt6`, and this file only pulls that same directory in unchanged.
 #
 # The tool/probe/test source lists below duplicate the ones hand-maintained
@@ -36,7 +36,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CORE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/Core)
 set(TOOLS_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/tools)
 
-# Preset loading (libsharpdx)
+# libsharpdx: every program loader needs it (Core/Basic/vendor/sharpdx/README.md)
 if(WIN32)
   set(SHARPDX_LIB ${CORE_ROOT}/Basic/vendor/sharpdx/sharpdx.lib)
 elseif(APPLE)
@@ -44,10 +44,28 @@ elseif(APPLE)
 else()
   set(SHARPDX_LIB ${CORE_ROOT}/Basic/vendor/sharpdx/libsharpdx-linux.a)
 endif()
+if(NOT EXISTS ${SHARPDX_LIB})
+  message(FATAL_ERROR "${SHARPDX_LIB} is missing -- run tools/fetch_sharpdx.sh (Linux/Windows) "
+                      "or tools/refresh_sharpdx.sh (macOS)")
+endif()
 
 # Core sources used by tools and tests
 set(CORE_COMMON_SOURCES
   ${CORE_ROOT}/Debug/BasicPointerTable.cpp
+  ${CORE_ROOT}/Debug/Disasm/Disassembly.cpp
+  ${CORE_ROOT}/Debug/Disasm/LH5801Disassembler.cpp
+  ${CORE_ROOT}/Debug/Disasm/Z80Disassembler.cpp
+  ${CORE_ROOT}/Debug/DebugTarget.cpp
+  ${CORE_ROOT}/Debug/DebugExpression.cpp
+  ${CORE_ROOT}/Debug/CpuRegisters.cpp
+  ${CORE_ROOT}/Debug/MachineDebugTargets.cpp
+  ${CORE_ROOT}/Debug/SourceMap.cpp
+  ${CORE_ROOT}/Debug/BreakpointTable.cpp
+  ${CORE_ROOT}/Debug/RunControl.cpp
+  ${CORE_ROOT}/Debug/ProgramLoader.cpp
+  ${CORE_ROOT}/Debug/Listing/Listing.cpp
+  ${CORE_ROOT}/Debug/Listing/SdasListing.cpp
+  ${CORE_ROOT}/Debug/Listing/ZasmListing.cpp
   ${CORE_ROOT}/CPU/LH5801/LH5801.cpp
   ${CORE_ROOT}/CPU/SC7852/SC7852.cpp
   ${CORE_ROOT}/CPU/LH5803/LH5803Memory.cpp
@@ -69,26 +87,21 @@ set(CORE_COMMON_SOURCES
   ${CORE_ROOT}/Display/LcdScreenshot.cpp
   ${CORE_ROOT}/KeyPaste.cpp
   ${CORE_ROOT}/MachineCodeFile.cpp
+  ${CORE_ROOT}/ProgramFile.cpp
+  ${CORE_ROOT}/DropFile.cpp
   ${CORE_ROOT}/PC1500/PC1500MachineCodeLoader.cpp
-  ${CORE_ROOT}/PC1600/PC1600MachineImage.cpp
   ${CORE_ROOT}/PC1600/PC1600MachineCodeLoader.cpp
   ${CORE_ROOT}/PC1600/PC1600ProgramPlacement.cpp
   ${CORE_ROOT}/PC1500/PC1500BasicTyper.cpp
   ${CORE_ROOT}/PC1600/PC1600BasicTyper.cpp
+  ${CORE_ROOT}/Preset/PresetFile.cpp
+  ${CORE_ROOT}/Preset/PresetRunner.cpp
+  ${CORE_ROOT}/PC1500/PC1500BasicLoader.cpp
+  ${CORE_ROOT}/PC1500/PC1500PresetLoader.cpp
+  ${CORE_ROOT}/PC1600/PC1600BasicLoader.cpp
+  ${CORE_ROOT}/PC1600/PC1600PresetLoader.cpp
+  ${CORE_ROOT}/Basic/BasicProgramSource.cpp
 )
-
-if(EXISTS ${SHARPDX_LIB})
-  list(APPEND CORE_COMMON_SOURCES
-    ${CORE_ROOT}/Preset/PresetFile.cpp
-    ${CORE_ROOT}/Preset/PresetRunner.cpp
-    ${CORE_ROOT}/PC1500/PC1500BasicLoader.cpp
-    ${CORE_ROOT}/PC1500/PC1500PresetLoader.cpp
-    ${CORE_ROOT}/PC1600/PC1600BasicLoader.cpp
-    ${CORE_ROOT}/PC1600/PC1600PresetLoader.cpp
-    ${CORE_ROOT}/Basic/BasicBinaryImage.cpp
-    ${CORE_ROOT}/Basic/BasicProgramSource.cpp
-  )
-endif()
 
 # -----------------------------------------------------------------------------
 # Qt6 GUI Application target
@@ -110,13 +123,12 @@ set(PC1500_CLI_SOURCES
   ${CORE_ROOT}/Preset/PresetFile.cpp
   ${CORE_ROOT}/Preset/PresetRunner.cpp
   ${CORE_ROOT}/MachineCodeFile.cpp
-  ${CORE_ROOT}/PC1600/PC1600MachineImage.cpp
+  ${CORE_ROOT}/ProgramFile.cpp
   ${CORE_ROOT}/PC1500/PC1500BasicTyper.cpp
   ${CORE_ROOT}/PC1500/PC1500BasicLoader.cpp
   ${CORE_ROOT}/PC1500/PC1500PresetLoader.cpp
   ${CORE_ROOT}/PC1500/PC1500MachineCodeLoader.cpp
   ${CORE_ROOT}/Display/LcdScreenshot.cpp
-  ${CORE_ROOT}/Basic/BasicBinaryImage.cpp
   ${CORE_ROOT}/Basic/BasicProgramSource.cpp
   ${CORE_ROOT}/PC1500/PC1500TraceFile.cpp
   ${CORE_ROOT}/Serial/PtySerialLink.cpp
@@ -124,9 +136,7 @@ set(PC1500_CLI_SOURCES
 )
 add_executable(pc1500_cli ${PC1500_CLI_SOURCES})
 target_include_directories(pc1500_cli PRIVATE ${CORE_ROOT})
-if(EXISTS ${SHARPDX_LIB})
-  target_link_libraries(pc1500_cli PRIVATE ${SHARPDX_LIB})
-endif()
+target_link_libraries(pc1500_cli PRIVATE ${SHARPDX_LIB})
 
 # pc1600_cli
 set(PC1600_CLI_SOURCES
@@ -137,6 +147,7 @@ set(PC1600_CLI_SOURCES
   ${CORE_ROOT}/Preset/PresetFile.cpp
   ${CORE_ROOT}/Preset/PresetRunner.cpp
   ${CORE_ROOT}/MachineCodeFile.cpp
+  ${CORE_ROOT}/ProgramFile.cpp
   ${CORE_ROOT}/PC1500/PC1500Keyboard.cpp
   ${CORE_ROOT}/PC1500/PC1500TraceFile.cpp
   ${CORE_ROOT}/Audio/PiezoSampler.cpp
@@ -150,19 +161,15 @@ set(PC1600_CLI_SOURCES
   ${CORE_ROOT}/PC1600/PC1600BasicTyper.cpp
   ${CORE_ROOT}/PC1600/PC1600BasicLoader.cpp
   ${CORE_ROOT}/PC1600/PC1600ProgramPlacement.cpp
-  ${CORE_ROOT}/PC1600/PC1600MachineImage.cpp
   ${CORE_ROOT}/PC1600/PC1600MachineCodeLoader.cpp
   ${CORE_ROOT}/PC1600/PC1600PresetLoader.cpp
   ${CORE_ROOT}/Display/LcdScreenshot.cpp
-  ${CORE_ROOT}/Basic/BasicBinaryImage.cpp
   ${CORE_ROOT}/Basic/BasicProgramSource.cpp
   ${TOOLS_ROOT}/pc1600_cli.cpp
 )
 add_executable(pc1600_cli ${PC1600_CLI_SOURCES})
 target_include_directories(pc1600_cli PRIVATE ${CORE_ROOT})
-if(EXISTS ${SHARPDX_LIB})
-  target_link_libraries(pc1600_cli PRIVATE ${SHARPDX_LIB})
-endif()
+target_link_libraries(pc1600_cli PRIVATE ${SHARPDX_LIB})
 
 # pc1600_power_probe
 set(PC1600_POWER_PROBE_SOURCES
@@ -199,6 +206,7 @@ set(PC1600_UART_PROBE_SOURCES
   ${CORE_ROOT}/Serial/PtySerialLink.cpp
   ${CORE_ROOT}/PC1600/PC1600Machine.cpp
   ${CORE_ROOT}/PC1600/PC1600BasicTyper.cpp
+  ${CORE_ROOT}/PC1600/PC1600ProgramPlacement.cpp
   ${CORE_ROOT}/PC1500/PC1500TraceFile.cpp
   ${TOOLS_ROOT}/pc1600_uart_probe.cpp
 )
@@ -218,6 +226,7 @@ set(PC1600_PLOTTER_PROBE_SOURCES
   ${CORE_ROOT}/Preset/PresetFile.cpp
   ${CORE_ROOT}/Preset/PresetRunner.cpp
   ${CORE_ROOT}/MachineCodeFile.cpp
+  ${CORE_ROOT}/ProgramFile.cpp
   ${CORE_ROOT}/PC1500/PC1500BasicTyper.cpp
   ${CORE_ROOT}/PC1500/PC1500PresetLoader.cpp
   ${CORE_ROOT}/PC1500/PC1500TraceFile.cpp
@@ -231,11 +240,9 @@ set(PC1600_PLOTTER_PROBE_SOURCES
   ${CORE_ROOT}/CPU/LH5803/LH5803SharedMemory.cpp
   ${CORE_ROOT}/PC1600/PC1600Machine.cpp
   ${CORE_ROOT}/PC1600/PC1600BasicTyper.cpp
-  ${CORE_ROOT}/PC1600/PC1600MachineImage.cpp
   ${CORE_ROOT}/PC1600/PC1600MachineCodeLoader.cpp
   ${CORE_ROOT}/PC1600/PC1600PresetLoader.cpp
   ${CORE_ROOT}/Display/LcdScreenshot.cpp
-  ${CORE_ROOT}/Basic/BasicBinaryImage.cpp
   ${CORE_ROOT}/Basic/BasicProgramSource.cpp
   ${CORE_ROOT}/PC1500/PC1500BasicLoader.cpp
   ${CORE_ROOT}/PC1600/PC1600BasicLoader.cpp
@@ -245,9 +252,7 @@ set(PC1600_PLOTTER_PROBE_SOURCES
 )
 add_executable(pc1600_plotter_probe ${PC1600_PLOTTER_PROBE_SOURCES})
 target_include_directories(pc1600_plotter_probe PRIVATE ${CORE_ROOT})
-if(EXISTS ${SHARPDX_LIB})
-  target_link_libraries(pc1600_plotter_probe PRIVATE ${SHARPDX_LIB})
-endif()
+target_link_libraries(pc1600_plotter_probe PRIVATE ${SHARPDX_LIB})
 
 # -----------------------------------------------------------------------------
 # Test Suite target
@@ -280,27 +285,30 @@ set(TEST_SOURCES
   ${CORE_ROOT}/tests/pc1600_preset_tests.cpp
   ${CORE_ROOT}/tests/ce1600p_tests.cpp
   ${CORE_ROOT}/tests/ce1600f_tests.cpp
+  ${CORE_ROOT}/tests/host_directory_drive_tests.cpp
+  ${CORE_ROOT}/tests/pc1600_host_drive_tests.cpp
   ${CORE_ROOT}/tests/ce150_tests.cpp
   ${CORE_ROOT}/tests/pc1600_ce150_tests.cpp
   ${CORE_ROOT}/tests/ce158_tests.cpp
-  ${CORE_ROOT}/tests/basic_binary_image_tests.cpp
   ${CORE_ROOT}/tests/basic_fastloader_tests.cpp
   ${CORE_ROOT}/tests/pc1600_basicloader_tests.cpp
   ${CORE_ROOT}/tests/basic_program_source_tests.cpp
   ${CORE_ROOT}/tests/pc1600_program_placement_tests.cpp
-  ${CORE_ROOT}/tests/pc1600_machine_image_tests.cpp
   ${CORE_ROOT}/tests/piezo_sampler_tests.cpp
   ${CORE_ROOT}/tests/key_paste_tests.cpp
   ${CORE_ROOT}/tests/lcd_screenshot_tests.cpp
   ${CORE_ROOT}/tests/machine_code_file_tests.cpp
+  ${CORE_ROOT}/tests/program_file_tests.cpp
+  ${CORE_ROOT}/tests/disasm_tests.cpp
+  ${CORE_ROOT}/tests/debug_target_tests.cpp
+  ${CORE_ROOT}/tests/listing_tests.cpp
+  ${CORE_ROOT}/tests/run_control_tests.cpp
 )
 
 add_executable(CoreTests ${TEST_SOURCES})
 target_include_directories(CoreTests PRIVATE ${CORE_ROOT})
 target_link_libraries(CoreTests PRIVATE ZLIB::ZLIB)
-if(EXISTS ${SHARPDX_LIB})
-  target_link_libraries(CoreTests PRIVATE ${SHARPDX_LIB})
-endif()
+target_link_libraries(CoreTests PRIVATE ${SHARPDX_LIB})
 
 enable_testing()
 add_test(NAME CoreTests COMMAND CoreTests WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

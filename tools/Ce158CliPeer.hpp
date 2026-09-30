@@ -12,6 +12,7 @@
 
 #include "../Core/Connector/Ce158Card.hpp"
 #include "../Core/Serial/PtySerialLink.hpp"
+#include "CliCommon.hpp"
 
 // --ce158-rx / --ce158-tx: a file-backed serial peer for repeatable runs.
 class FileSerialLink final : public SerialLink {
@@ -61,11 +62,10 @@ public:
             machine.setCE158SerialLink(m_ptyLink.get());
         } else if (!m_rxPath.empty() || !m_txPath.empty()) {
             if (!m_rxPath.empty()) {
-                std::FILE* f = std::fopen(m_rxPath.c_str(), "rb");
-                if (!f) { std::fprintf(stderr, "cannot read %s\n", m_rxPath.c_str()); return false; }
-                int ch;
-                while ((ch = std::fgetc(f)) != EOF) m_file.rx.push_back(static_cast<uint8_t>(ch));
-                std::fclose(f);
+                if (!cli::readFile(m_rxPath, &m_file.rx)) {
+                    std::fprintf(stderr, "cannot read %s\n", m_rxPath.c_str());
+                    return false;
+                }
             }
             m_file.holdPolls = m_hold;
             machine.setCE158SerialLink(&m_file);
@@ -84,10 +84,9 @@ public:
             if (!m_rxPath.empty())
                 std::printf("CE-158 serial: received %zu of %zu scripted bytes\n", m_file.rxPos, m_file.rx.size());
             if (!m_txPath.empty() || !m_rxPath.empty()) printCe158Bytes("CE-158 serial output", m_file.tx);
-            if (!m_txPath.empty()) {
-                std::FILE* f = std::fopen(m_txPath.c_str(), "wb");
-                if (!f) { std::fprintf(stderr, "cannot write %s\n", m_txPath.c_str()); ok = false; }
-                else { std::fwrite(m_file.tx.data(), 1, m_file.tx.size(), f); std::fclose(f); }
+            if (!m_txPath.empty() && !cli::writeFile(m_txPath, m_file.tx)) {
+                std::fprintf(stderr, "cannot write %s\n", m_txPath.c_str());
+                ok = false;
             }
         }
         machine.setCE158SerialLink(nullptr);

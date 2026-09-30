@@ -26,14 +26,57 @@
 struct PasteStep {
     std::string key;         // key name in the machine's vocabulary
     bool needsShift = false; // tap SHIFT (a one-shot latch) first
+    bool needsKbii = false;  // PC-1600: wrap in KBII taps (latch on, off again)
 };
 
 using TypedCharResolver = bool (*)(char c, std::string* baseKey, bool* needsShift);
+/// Resolves a non-ASCII character to a KBII key (pc1600ResolveKbiiChar).
+using KbiiCharResolver = bool (*)(char32_t cp, std::string* baseKey, bool* needsShift);
 
-/// Turns pasted text into steps. Only the text before the first line break
-/// (CR or LF) is used; control characters, non-ASCII bytes and characters
-/// `resolve` has no key for are skipped.
-std::vector<PasteStep> buildPasteSteps(const std::string& text, TypedCharResolver resolve);
+/// Turns pasted (UTF-8) text into steps. Only the text before the first
+/// line break (CR or LF) is used; control characters, characters `resolve`
+/// has no key for, and non-ASCII characters `resolveKbii` has no key for
+/// (all of them without one) are skipped.
+std::vector<PasteStep> buildPasteSteps(const std::string& text, TypedCharResolver resolve,
+                                       KbiiCharResolver resolveKbii = nullptr);
+
+/// SHIFT / KBII as latched on the machine when an accented character's
+/// KBII sequence is about to start (pc1600ReadLatches):
+///   nothing latched  KBII, [SHIFT,] key, KBII
+///   SHIFT            SHIFT (un-latch -- with SHIFT on, the KBII key is the
+///                    key-click toggle), then the same
+///   KBII (+/- SHIFT) nothing: the character is dropped silently
+struct KeyLatches {
+    bool shift = false;
+    bool kbii = false;
+};
+
+/// One tap of an accented character's KBII sequence. Every KBII / SHIFT tap
+/// is followed by the SHIFT gap, so the key-scan sees it before the next key.
+struct KbiiTap {
+    std::string key;
+    bool gapAfter = false;
+};
+
+/// The taps that type `key` (with SHIFT first when `shift`) under KBII,
+/// given what is latched (see KeyLatches); empty when the character is
+/// dropped. The last tap is the closing KBII. The one place the rule lives:
+/// the paste feeder and PC1600BasicTyper both play it.
+inline std::vector<KbiiTap> kbiiSequence(const std::string& key, bool shift, const KeyLatches& latched) {
+    if (latched.kbii) return {}; // the user's own KBII is on: ignored silently
+
+    // KBII latches until tapped again: every accented character is its own
+    // KBII-on ... KBII-off sequence, so the next character always starts
+    // with KBII off.
+    std::vector<KbiiTap> seq;
+    // With SHIFT on, the KBII key toggles the key click: un-latch it.
+    if (latched.shift) seq.push_back({"shift", true});
+    seq.push_back({"kbii", true});
+    if (shift) seq.push_back({"shift", true});
+    seq.push_back({key, false});
+    seq.push_back({"kbii", true});
+    return seq;
+}
 
 /// Per-model cadence, all in emulated 60 Hz frames.
 struct PastePacing {
@@ -57,6 +100,7 @@ inline PastePacing pc1600PastePacing() {
 class KeyPasteFeeder {
 public:
     using KeyFn = std::function<void(const std::string&)>;
+    using LatchFn = std::function<KeyLatches()>;
 
     void setPacing(const PastePacing& pacing) { m_pacing = pacing; }
 
@@ -66,21 +110,32 @@ public:
     bool active() const { return m_hasCurrent || !m_queue.empty(); }
 
     /// Drops everything still queued; releases a key currently held down.
-    void cancel(const KeyFn& release);
+    /// With `finishKbii` (a live keystroke interrupting a paste -- not a
+    /// reset, which drops everything), a KBII sequence already under way is
+    /// finished instead: an opening KBII tap still held runs to the end and
+    /// the closing tap stays queued, so KBII isn't left latched.
+    void cancel(const KeyFn& release, bool finishKbii = false);
 
-    /// Call once after every emulated frame.
-    void onFrame(const KeyFn& press, const KeyFn& release);
+    /// Call once after every emulated frame. `latches` reports the machine's
+    /// SHIFT / KBII latches when an accented character starts (see
+    /// KeyLatches); without it nothing counts as latched.
+    void onFrame(const KeyFn& press, const KeyFn& release, const LatchFn& latches = {});
 
 private:
     struct Action {
-        enum class Kind { Tap, Wait };
+        enum class Kind { Tap, Wait, KbiiChar };
         Kind kind = Kind::Wait;
-        std::string key; // Tap
-        int frames = 0;  // Wait
+        std::string key;          // Tap, KbiiChar
+        int frames = 0;           // Wait
+        bool closesKbii = false;  // Tap: the KBII tap that un-latches a sequence's KBII
+        bool shift = false;       // KbiiChar: from the SHIFT+KBII table
     };
     enum class TapPhase { Hold, Gap };
 
     void begin(const Action& action, const KeyFn& press);
+    // Replaces the KbiiChar at the queue's front by its taps, per the
+    // machine's latches (KeyLatches) -- or drops it.
+    void expandKbiiChar(const KeyLatches& latched);
     bool elapse(const KeyFn& release); // true once the current action is done
 
     PastePacing m_pacing;
@@ -89,4 +144,5 @@ private:
     Action m_current;
     TapPhase m_tapPhase = TapPhase::Hold;
     int m_framesLeft = 0;
+    bool m_kbiiLatched = false; // an opening KBII tap has been typed, its closing one not yet
 };

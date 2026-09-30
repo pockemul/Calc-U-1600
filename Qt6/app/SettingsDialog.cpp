@@ -2,7 +2,9 @@
 #include "AppPaths.hpp"
 #include "AppSettings.hpp"
 #include "MachineController.hpp"
+#include "debug/DebugController.hpp"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFileDialog>
@@ -142,11 +144,14 @@ PathRowSpec directorySpec(QWidget* parent, const QString& label, const QString& 
 
 // One file-open start folder row (AppSettings::OpenFolder). Unset -- the
 // default, and what Reset restores -- shows "<last used>": that dialog
-// starts wherever a file was last picked from.
+// starts wherever a file was last picked from (or, for HostDrive, in the
+// directory last mounted).
 void addOpenFolderRow(QGridLayout* grid, int row, QWidget* parent, SectionGrids& sections, const QString& label,
                       const QString& dialogTitle, AppSettings::OpenFolder folder) {
     PathRowSpec spec = directorySpec(parent, label, dialogTitle, [folder] { return AppSettings::openStartDir(folder); });
-    spec.resetToolTip = SettingsDialog::tr("Start in the folder a file was last loaded from");
+    spec.resetToolTip = folder == AppSettings::OpenFolder::HostDrive
+                            ? SettingsDialog::tr("Start in the directory last mounted")
+                            : SettingsDialog::tr("Start in the folder a file was last loaded from");
     spec.display = [folder] {
         const QString dir = AppSettings::openDir(folder);
         return dir.isEmpty() ? SettingsDialog::tr("<last used>") : dir;
@@ -216,6 +221,8 @@ SettingsDialog::SettingsDialog(MachineController* controller, QWidget* parent)
                      AppSettings::OpenFolder::Basic);
     addOpenFolderRow(general, 3, this, sections, tr("Assembly folder:"), tr("Choose Assembly Folder"),
                      AppSettings::OpenFolder::Assembly);
+    addOpenFolderRow(general, 4, this, sections, tr("Host drive folder:"), tr("Choose Host Drive Folder"),
+                     AppSettings::OpenFolder::HostDrive);
 
     // ── Default presets ──────────────────────────────────────────────────
     // Applied whenever that model gets selected (including at startup) --
@@ -232,7 +239,7 @@ SettingsDialog::SettingsDialog(MachineController* controller, QWidget* parent)
     {
         PathRowSpec spec = directorySpec(this, tr("Battery-card saves:"), tr("Choose Save Directory"),
                                          [] { return AppPaths::instanceDir(); });
-        spec.display = [] { return AppPaths::forDisplay(AppPaths::instanceDir()); };
+        spec.display = [] { return AppPaths::displayPath(AppPaths::instanceDir()); };
         spec.isOverridden = [] { return !AppSettings::instanceDirOverride().isEmpty(); };
         spec.set = [](const QString& dir) { AppSettings::setInstanceDirOverride(dir); };
         addPathRow(storage, 0, this, sections, spec);
@@ -245,7 +252,7 @@ SettingsDialog::SettingsDialog(MachineController* controller, QWidget* parent)
                                          [] { return AppPaths::instanceDir(); });
         spec.display = [] {
             const QString dir = AppSettings::traceDirOverride();
-            return dir.isEmpty() ? AppPaths::forDisplay(AppPaths::instanceDir()) : dir;
+            return AppPaths::displayPath(dir.isEmpty() ? AppPaths::instanceDir() : dir);
         };
         spec.isOverridden = [] { return !AppSettings::traceDirOverride().isEmpty(); };
         spec.set = [](const QString& dir) { AppSettings::setTraceDirOverride(dir); };
@@ -273,16 +280,16 @@ SettingsDialog::SettingsDialog(MachineController* controller, QWidget* parent)
     ce158StatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     auto refreshSerialStatusLabel = [this, serialStatusLabel, ce158StatusLabel] {
         const QString status = m_controller ? m_controller->serialLinkStatus() : QString();
-        serialStatusLabel->setText(status.isEmpty() ? tr("(PC-1600 not active)") : AppPaths::forDisplay(status));
+        serialStatusLabel->setText(status.isEmpty() ? tr("(PC-1600 not active)") : AppPaths::displayPath(status));
         const QString ce158 = m_controller ? m_controller->ce158SerialLinkStatus() : QString();
-        ce158StatusLabel->setText(ce158.isEmpty() ? tr("(CE-158 not attached)") : AppPaths::forDisplay(ce158));
+        ce158StatusLabel->setText(ce158.isEmpty() ? tr("(CE-158 not attached)") : AppPaths::displayPath(ce158));
     };
     {
         PathRowSpec spec = directorySpec(this, tr("Symlink directory:"), tr("Choose Serial Port Directory"),
                                          [] { return AppPaths::instanceDir(); });
         spec.display = [] {
             const QString dir = AppSettings::serialLinkDirOverride();
-            return dir.isEmpty() ? AppPaths::forDisplay(AppPaths::instanceDir()) : dir;
+            return AppPaths::displayPath(dir.isEmpty() ? AppPaths::instanceDir() : dir);
         };
         spec.isOverridden = [] { return !AppSettings::serialLinkDirOverride().isEmpty(); };
         spec.set = [](const QString& dir) { AppSettings::setSerialLinkDirOverride(dir); };
@@ -298,6 +305,47 @@ SettingsDialog::SettingsDialog(MachineController* controller, QWidget* parent)
     serial->addWidget(ce158StatusLabel, 2, kValueColumn, 1, 3);
     refreshSerialStatusLabel();
 #endif
+
+    // ── Debugger ─────────────────────────────────────────────────────────
+    // The Debug Adapter Protocol server VS Code attaches to (localhost only).
+    if (m_controller) {
+        QGridLayout* debugger =
+            addSection(layout, this, sections, tr("Debugger"), QStringLiteral("dialog.settings.debugger"));
+        addRowLabel(debugger, 0, this, sections, tr("Debug server:"));
+        auto* enable = new QCheckBox(tr("Accept a debugger (VS Code) on 127.0.0.1"), this);
+        enable->setChecked(AppSettings::dapEnabled());
+        debugger->addWidget(enable, 0, kValueColumn, 1, 3, Qt::AlignLeft);
+        addRowLabel(debugger, 1, this, sections, tr("Port:"));
+        auto* port = new QSpinBox(this);
+        port->setRange(1024, 65535);
+        port->setValue(AppSettings::dapPort());
+        debugger->addWidget(port, 1, kValueColumn, Qt::AlignLeft);
+        addRowLabel(debugger, 2, this, sections, tr("Status:"));
+        auto* status = new QLabel(this);
+        status->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        debugger->addWidget(status, 2, kValueColumn, 1, 2);
+        auto* disconnect = makeRowButton(tr("Disconnect"), this);
+        disconnect->setToolTip(tr("Drop the attached debugger; the calculator runs on"));
+        debugger->addWidget(disconnect, 2, kResetColumn);
+        DebugController* debug = m_controller->debugController();
+        connect(disconnect, &QPushButton::clicked, debug, &DebugController::disconnectClient);
+        auto refreshStatus = [status, disconnect, debug] {
+            status->setText(debug->serverStatus());
+            disconnect->setEnabled(debug->hasClient());
+        };
+        refreshStatus();
+        connect(debug, &DebugController::serverStatusChanged, status, refreshStatus);
+        connect(enable, &QCheckBox::toggled, this, [this](bool on) {
+            AppSettings::setDapEnabled(on);
+            m_controller->refreshDebugServer();
+        });
+        // Rebind once editing settles, not on every keystroke.
+        connect(port, &QSpinBox::editingFinished, this, [this, port] {
+            if (port->value() == AppSettings::dapPort()) return;
+            AppSettings::setDapPort(port->value());
+            m_controller->refreshDebugServer();
+        });
+    }
 
     alignLabelColumns(sections);
 

@@ -13,13 +13,15 @@
 #include "Display/LcdScreenshot.hpp"
 #include "KeyPaste.hpp"
 #include "PC1500/PC1500Variant.hpp"
+#include "Serial/LazySerialLink.hpp"
+#include "Serial/PtySerialLink.hpp"
 #include "TraceTypes.hpp"
 
 class PC1500Machine;
 class PC1600Machine;
 class MemoryModuleManager;
+class DebugController;
 class FloppyDiskManager;
-class PtySerialLink;
 
 namespace MachineControllerNS {
 enum class Model { PC1500, PC1500A, PC1600 };
@@ -123,27 +125,24 @@ public:
     PC1600RomVersion pc1600RomVersion() const { return m_pc1600RomVersion; }
 
     // CE-1600P ROM version (independent of the PC-1600 one; the CE-1600F
-    // follows it). Rebuilds the machine, keeping the plotter, when a CE-1600P
-    // is attached; otherwise only remembers the choice for the next attach.
-    // Returns whether it rebuilt.
-    bool setCE1600PRomVersion(CE1600PRomVersion version);
+    // follows it). Only records the choice for the next attach -- the ROM sits
+    // in the CE-1600P box, so changing it on an attached one is a box swap,
+    // see swapCE1600PRom().
+    void setCE1600PRomVersion(CE1600PRomVersion version) { m_ce1600pRomVersion = version; }
     CE1600PRomVersion ce1600pRomVersion() const { return m_ce1600pRomVersion; }
 
     // Reset (`allReset` = ALL RESET on the PC-1600; the PC-1500 has one
     // level), then run the boot flat out until the ROM waits at the prompt
-    // -- including a plotter's power-on init -- and set the clock from the
-    // host. Synchronous: the caller stops the frame timer around it (see
-    // PresetController::resetLive()).
+    // -- including a plotter's power-on init. Synchronous: the caller stops
+    // the frame timer around it (see PresetController::resetLive()), and
+    // restarting it sets the clock.
     void resetToPrompt(bool allReset);
 
-    // Every host clock seed above happens while the machine runs flat out
-    // with the frame timer stopped; wall time keeps passing until paced
-    // emulation actually resumes (the Loading sheet closing, a late first
-    // tick capped at MainWindow's kMaxTickSeconds), which left the clock
-    // up to ~1 s behind. The first paced frame tick calls this instead: it
-    // re-seeds once if a seed is pending, and says so -- the caller then
-    // rebases its pacing on this moment rather than advancing.
-    bool resyncClockIfSeeded();
+    // Sets the live machine's clock from the host. Called when paced
+    // emulation (re)starts (EmulationPacer::restart()): every flat-out run
+    // before it -- a boot, a preset, a power cycle -- went seconds ahead of
+    // (or, with wall time passing meanwhile, behind) the host clock.
+    void seedClockFromHost();
 
     // The plotter attach/detach power cycle, flat out: OFF, wait for the
     // emulated ROM to power down, `change()` (the instantaneous attach or
@@ -195,9 +194,26 @@ public:
     // in progress. Driven from advance(), so it pauses/turbos with the
     // emulation. Any machine swap or reset cancels it.
     void pasteText(const std::string& text);
-    bool pasteActive() const { return m_paste.active(); }
-    // Drops the rest of the paste, releasing a key it holds down.
+    // The inbound counterpart for tools (the debugger's auto-start): types
+    // `line` at the same cadence, then presses ENTER -- it is meant to run
+    // something. Both models. Shares the paste queue.
+    void typeCommand(const std::string& line);
+    bool pasteActive() const { return m_paste.active() && !m_liveTyping; }
+    // Drops the rest of the paste, releasing a key it holds down (resets,
+    // machine swaps: nothing is finished).
     void cancelPaste();
+    // A live keystroke stops a paste: like cancelPaste(), but an accented
+    // character's KBII sequence under way is finished (its closing KBII tap
+    // stays queued, as live typing) so KBII isn't left latched.
+    void interruptPaste();
+
+    // PC-1600 live host keys that need a key *sequence*: an accented
+    // character (KBII, [SHIFT,] key, KBII), and any key typed while such a
+    // sequence is still running -- queued behind it on the paste feeder's
+    // frame-paced cadence, so a fast "für" can't press R while KBII is
+    // still latched.
+    void typeLiveStep(const PasteStep& step);
+    bool liveTypingActive() const { return m_paste.active() && m_liveTyping; }
 
     // Edit > Copy Screen: the active display's dot matrix as a physically
     // sized greyscale image (Core/Display/LcdScreenshot.hpp) -- the same
@@ -245,6 +261,11 @@ public:
     // link is created lazily on first PC-1600 activation and then kept
     // alive across model switches (see attachSerialLink() in the .cpp).
     void refreshSerialLinkDirectory();
+
+    // The debugger (DAP server + session), see debug/DebugController.
+    DebugController* debugController() const { return m_debug.get(); }
+    // Starts, stops or rebinds the DAP server after a Settings change.
+    void refreshDebugServer();
     // The path a serial client should open (the stable symlink, or the raw
     // PTY slave if no symlink could be made), or empty when no PC-1600 has
     // ever been activated yet / the PTY failed to open.
@@ -266,7 +287,7 @@ public:
     // as in switchModel()) (same bytes/order as
     // switchModel()'s PC-1600 branch) but no module attach or reset --
     // PC1600PresetLoader.cpp does both itself, driven by the preset's own
-    // memory-expansion-1:/-2: blocks.
+    // slot-1:/slot-2: keys.
     PC1600Machine& resetBareForPresetPC1600(PC1600RomVersion version, CE1600PRomVersion ce1600pVersion);
     // Call once the preset loader returns, success or failure alike: the
     // machine object was already swapped in by resetBareForPreset*()
@@ -299,10 +320,11 @@ public:
     // into the file as it goes (PC1500Machine/PC1600Machine::
     // beginCpuTrace()), so nothing is lost between frame ticks. False if
     // the file can't be opened or a capture is already running. A machine
-    // rebuild (switchModel(), resetBareForPreset*()) ends the capture and
-    // emits traceEndedByRebuild().
+    // rebuild (switchModel(), resetBareForPreset*()) ends the capture.
     bool beginTrace(const QString& path);
     void endTrace();
+    // Bytes the active capture has written so far (0 when none).
+    std::uint64_t traceBytes() const;
     bool traceActive() const;
 
     // ---- Plotter support (PlotterController/PlotterPaperWidget only) ----
@@ -321,7 +343,25 @@ public:
     bool ce150Attached() const;
     bool attachCE1600P(QString* error = nullptr); // PC1600 only; false (no-op) otherwise
     void detachCE1600P();
+    // Swaps the attached CE-1600P for one with the `version` ROM: detach,
+    // attach, and the disk moves from the old drive to the new one with the
+    // same side up (changed-disk latch armed, as on a real insert). Run it
+    // inside powerCycleAround() -- like any attach/detach, the calculator must
+    // be off. False (with `error`) if the new box couldn't be attached.
+    bool swapCE1600PRom(CE1600PRomVersion version, QString* error = nullptr);
     bool ce1600pAttached() const;
+
+    // Host-directory drive S3: / Y: (PC-1600 only): a host directory as a
+    // PC-1600 file device (PC1600HostDriveCard). attachHostDrive() on a
+    // drive that isn't attached must run inside powerCycleAround() (the ROM
+    // finds the module at power-on); with the drive attached it only swaps
+    // the directory, live. detachHostDrive() likewise needs the power cycle.
+    // The mount survives a same-model rebuild (ROM switch), not a model
+    // switch, and is not saved across launches.
+    bool attachHostDrive(const QString& dir, QString* error = nullptr);
+    void detachHostDrive();
+    bool hostDriveAttached() const;
+    QString hostDriveDirectory() const; // empty = no host drive
 
     // CE-158 RS-232C / parallel interface: PC1500(A), or a PC-1600's LH5803
     // side (MODE 1). Same live power-cycled attach as the plotters; it
@@ -332,10 +372,6 @@ public:
     bool ce158Attached() const;
     // What the CE-158 printed on its parallel port since the last call.
     std::vector<std::uint8_t> drainCE158PrinterOutput();
-    // Gives an attached CE-158 its host PTY (created on first use, then
-    // kept for the app's life). Called after every point that can attach a
-    // CE-158 behind this class's back -- a preset, a machine rebuild.
-    void syncCE158SerialLink();
 
     std::vector<AlpsPlotterMechanism::FlatPoint> ce150PlotPoints() const;
     std::uint64_t ce150PlotRevision() const;
@@ -344,18 +380,36 @@ public:
     std::uint64_t ce1600pPlotRevision() const;
     void clearCE1600PPaper();
 
-    // True while the active machine is powered on -- PC1600: sc7852Owns()
-    // (false once the OFF-key/auto-power-off handoff parks it on the
-    // LH5803 side); PC1500(A): !cpu().poweredOff(). PlotterController polls
+    // True while the active machine is powered on -- PC1600: the sub-CPU
+    // has not switched the system off (isPoweredOff()); PC1500(A):
+    // !cpu().poweredOff(). PlotterController polls
     // this while waiting for a synthetic OFF keypress to actually land.
     bool isMachinePoweredOn() const;
 
+    // Runs `f` on whichever machine is live (both share the method names
+    // used here); the second form returns `none` when there is none.
+    template <class F>
+    void withMachine(F&& f) const {
+        if (m_pc1600) f(*m_pc1600);
+        else if (m_pc1500) f(*m_pc1500);
+    }
+    template <class R, class F>
+    R withMachine(R none, F&& f) const {
+        if (m_pc1600) return f(*m_pc1600);
+        if (m_pc1500) return f(*m_pc1500);
+        return none;
+    }
+
 signals:
     void modelChanged(Model model);
-    // A machine rebuild ended the active TRACE capture (see beginTrace()).
-    void traceEndedByRebuild();
+    // refreshSerialLinkDirectory() moved the PTY symlinks.
+    void serialLinksMoved();
 
 private:
+    // pasteText() / typeCommand(): queues `text` at the model's paste
+    // cadence, then ENTER if asked.
+    void enqueueTyped(const std::string& text, bool pressEnter);
+
     Model m_model = Model::PC1500A;
     PC1500RomRevision m_pc1500RomRevision = PC1500RomRevision::A04;
     PC1600RomVersion m_pc1600RomVersion = PC1600RomVersion::New;
@@ -363,11 +417,13 @@ private:
     std::unique_ptr<PC1500Machine> m_pc1500;
     std::unique_ptr<PC1600Machine> m_pc1600;
     KeyPasteFeeder m_paste;
+    bool m_liveTyping = false; // m_paste holds live keystrokes (typeLiveStep()), not a paste
     std::uint64_t m_pasteFrameCycles = 0; // cycles run since the paste feeder's last frame boundary
     void runActive(std::uint64_t cycles);
-    // Ends an active TRACE capture on the machine about to be replaced
-    // (its file closed with SESSION_END) and emits traceEndedByRebuild().
-    void endTraceBeforeRebuild();
+    // Drops the live machine before a rebuild: ends its TRACE capture (the
+    // file closed with SESSION_END), cancels a paste typing into it,
+    // destroys it.
+    void discardMachine();
     void pasteOnFrame();
     MemoryModuleManager* m_moduleManager = nullptr; // not owned
     FloppyDiskManager* m_floppyManager = nullptr;   // not owned
@@ -378,9 +434,19 @@ private:
     // host-visible symlink shouldn't disappear/reappear just because the
     // user switched models or loaded a preset.
     std::unique_ptr<PtySerialLink> m_serialLink;
-    // The CE-158's PTY: created the first time a CE-158 is attached, then
-    // kept like m_serialLink (see syncCE158SerialLink()).
-    std::unique_ptr<PtySerialLink> m_ce158SerialLink;
+    // The CE-158's link, handed to every machine as it is built (see
+    // wireNewMachine()). Its PTY only opens once a CE-158 -- attached from
+    // the GUI or by a preset -- first talks to it, then stays for the app's
+    // life like m_serialLink.
+    LazySerialLink<PtySerialLink> m_ce158SerialLink{[] {
+        return std::make_unique<PtySerialLink>(effectiveSerialLinkDir().toStdString(),
+                                               PtySerialLink::kCE158LinkName);
+    }};
+    // Hands a just-built m_pc1500/m_pc1600 its host serial links and tells
+    // the debugger (pairs with discardMachine()). Called at every point
+    // that constructs one, before anything is attached.
+    void wireNewMachine();
+
 
     // Where Core's BundledRomCatalog should look for bundled ROM files --
     // AppPaths::bundledResourcesDir(), the same directory the .card.yaml
@@ -391,11 +457,11 @@ private:
     // ROM set. A missing/incomplete old set warns and falls back to (and
     // remembers) the new one; a new-set failure quits the app.
     void makePC1600WithRomFallback();
-    void seedClockFromHost();
-    void seedClockFromHostNow();
-    bool m_clockResyncPending = false; // see resyncClockIfSeeded()
     // AppSettings::serialLinkDirOverride(), falling back to AppPaths::instanceDir().
     static QString effectiveSerialLinkDir();
+    // Declared after the machines so it goes first on destruction: its
+    // debug target still refers to the live machine.
+    std::unique_ptr<DebugController> m_debug;
     // Ensures m_serialLink exists (constructing it from the effective
     // AppSettings directory on first call) and attaches it to `machine` --
     // called after every point that (re)constructs m_pc1600.

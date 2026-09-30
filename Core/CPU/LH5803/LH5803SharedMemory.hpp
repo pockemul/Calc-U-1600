@@ -6,8 +6,7 @@
 
 #include "../LH5801/LH5801.hpp"
 #include "LH5803Rom.hpp"
-#include "../../Connector/Ce150Card.hpp"
-#include "../../Connector/Ce158Card.hpp"
+#include "../../Connector/ExpansionCard.hpp"
 
 class PC1600Memory;
 class PC1600BusArbiter;
@@ -28,18 +27,23 @@ class PC1600BusArbiter;
 // Slot 1/2.
 //
 //   0000-7FFF  forwarded to sharedMem.read/write(addr + 0x8000)
-//   8000-BFFF  peripheral ROM window, selected by the LH5803's own PV:
-//              CE-150 ROM (PV=0, A000-BFFF) or CE-158 ROM (PV=1,
-//              8000-9FFF, PU picks its 8 KB bank). Open bus where no
-//              attached card answers. The LH5803 ROM sets PV itself from
-//              CALLH's PARBAN (E224: RPV, then SPV if (700EH) bit 0).
+//   8000-BFFF  peripheral ROM window, offered to the cards on
+//              PC1600Memory::lh5803PeripheralBus(): CE-150 ROM (PV=0,
+//              A000-BFFF) or CE-158 ROM (PV=1, 8000-9FFF, PU picks its
+//              8 KB bank). Open bus where no attached card answers. The
+//              LH5803 ROM sets PV itself from CALLH's PARBAN (E224: RPV,
+//              then SPV if (700EH) bit 0).
 //   C000-FFFF  LH5803-private internal ROM (PC1600-LH5803-C000-FFFF-new.bin), fixed, loadable
 //
 // ME1 defaults to aliasing ME0, EXCEPT:
-//   * ME1 0x8000-0xBFFF: an I/O cycle on the bus (the LH5803's ME1 is the
-//     SC7852's IORQ), so it never selects the ME0 peripheral-ROM window.
-//     Passed to the cards with me1=true -- the CE-150's LH5810 answers at
-//     0xB008-0xB00F -- and open bus otherwise.
+//   * ME1 0x8000-0xFFFF (after the mainboard decodes below): offered to the
+//     cards with me1=true, terminal when one claims it -- the CE-150's
+//     LH5810 at 0xB008-0xB00F, the CE-158's LH5811 / UART / interrupt-ID
+//     blocks at 0xD000-0xD3FF / 0xDE00-0xDFFF. This host doesn't know
+//     which card sits where.
+//   * ME1 0x8000-0xBFFF that no card claims: an I/O cycle on the bus (the
+//     LH5803's ME1 is the SC7852's IORQ), so it never selects the ME0
+//     peripheral-ROM window -- open bus.
 //   * 0xA038: `STA #(0A038H)` is the LH5803-side handoff trigger (the
 //     LH5803-side alias of the SC7852's Port 38H, since the LH5803 has no
 //     I/O space of its own) -- forwarded to a PC1600BusArbiter via
@@ -61,10 +65,11 @@ class PC1600BusArbiter;
 //     drives the OFF-path clock save through it -- `rom1500 E538`:
 //     `bii #(0x0023),0x20` (poll a UART status bit), `sta #(0x0021)`
 //     (parallel-out = sub-CPU command), `lda #(0x0033)` (sub-CPU answer).
-//     The `#(...)` addresses are literal ME1 offsets 20H-27H / 33H;
-//     0xA020-0xA033 (the 30-3FH shadow at #A03xH convention, extended to
-//     the UART block) are routed the same way for safety.
-//     TODO(trace): pin down which of the two forms the ROM actually uses.
+//     The `#(...)` addresses are literal ME1 offsets 20H-27H / 33H, and
+//     that is the only form rom1500 uses for this block (its #(A03xH)
+//     accesses all go to the 30-3FH control ports). 0xA020-0xA033 is
+//     routed the same way by analogy with that A03xH shadow; no ROM path
+//     depends on it and it is unverified on hardware.
 class LH5803SharedMemory : public LH5801Bus {
 public:
     explicit LH5803SharedMemory(PC1600Memory& sharedMem) : m_shared(sharedMem) {}
@@ -79,23 +84,6 @@ public:
     void updatePUPV(bool pu, bool pv) { m_pu = pu; m_pv = pv; }
     bool pv() const { return m_pv; }
 
-    /// Attach/detach a CE-150 plotter (the same card the PC-1500 uses;
-    /// non-owning, PC1600Machine owns it). Once attached the 8000-BFFF
-    /// window serves the CE-150 ROM at PV=0 and ME1 0xB008-0xB00F reaches
-    /// its LH5810 -- the CE-150 firmware then runs on the LH5803 exactly as
-    /// it does on a PC-1500's LH5801 (BASIC in MODE 1).
-    void attachCe150(Ce150Card* card) { m_ce150 = card; }
-    void detachCe150() { m_ce150 = nullptr; }
-    bool ce150Attached() const { return m_ce150 != nullptr; }
-
-    /// Attach/detach a CE-158 interface (the PC-1500's card, non-owning).
-    /// Its ROM answers in 8000-9FFF at PV=1; its LH5811 (ME1 0xD000-0xD1FF),
-    /// UART (0xD200-0xD3FF) and interrupt-ID register (0xDE00-0xDFFF) are
-    /// routed to it. Coexists with a CE-150.
-    void attachCe158(Ce158Card* card) { m_ce158 = card; }
-    void detachCe158() { m_ce158 = nullptr; }
-    bool ce158Attached() const { return m_ce158 != nullptr; }
-
     /// Loads the LH5803-private internal ROM at C000-FFFF (PC1600-LH5803-C000-FFFF-new.bin).
     /// Returns false (untouched) if `size` isn't exactly 16384 bytes.
     bool loadROM(const uint8_t* data, size_t size) { return m_rom.load(data, size); }
@@ -105,6 +93,22 @@ public:
     /// 0xF000-0xF00F. ROM/PV/card attachment are untouched (matching
     /// PC1500Memory::reset()'s scope). Called from PC1600Machine::reset*().
     void reset() { m_ioRegs.fill(0); }
+
+    /// Debugger view of the LH5803's ME0/ME1 without bus side effects.
+    /// The UART / sub-CPU block, ME1 8000-BFFF and any card register a read
+    /// would disturb (ExpansionCard::readHasSideEffects) can't be read
+    /// without side effects: `*readable` is false there and 0xFF is
+    /// returned. The internal PIO reads as its
+    /// latched register file.
+    uint8_t debugPeek(uint16_t addr, bool me1, bool* readable) const;
+
+    /// The LH5803's ME0 0000-7FFF is the Z-80's 8000-FFFF (the shared RAM
+    /// and the slot windows); false for LH5803 addresses outside it.
+    static constexpr bool toZ80Address(uint16_t lhAddr, uint16_t* z80Addr) {
+        if (lhAddr >= 0x8000) return false;
+        *z80Addr = static_cast<uint16_t>(lhAddr + 0x8000);
+        return true;
+    }
 
     // LH5801Bus
     uint8_t readME0(uint16_t addr) override;
@@ -125,6 +129,10 @@ private:
     /// forWrite, me1, PV, PU) -- no S-block/Y strobe, so no
     /// PC1500SignalDecode dependency here. See Ce150Card.hpp's "Bus
     /// dependency" note.
+    /// Shortcut: hands the LH5803's own PU/PV to the cards on their 40-pin
+    /// contacts. Real hardware routes PV out as SC7852 PVOUT, and the
+    /// LH5803's PU has no documented path to the connector (TODO.md,
+    /// "Expansion connectors").
     PinState peripheralPins(uint16_t addr, bool forWrite, bool me1) const {
         PinState p;
         p.address = addr;
@@ -135,34 +143,13 @@ private:
         return p;
     }
 
-    /// Offers an access to the attached cards, CE-158 first; 0xFF (open
-    /// bus) / ignored when none claims it.
-    uint8_t cardRead(uint16_t addr, bool me1) const {
-        if (!m_ce158 && !m_ce150) return 0xFF;
-        uint8_t v = 0xFF;
-        const PinState p = peripheralPins(addr, /*forWrite=*/false, me1);
-        if (m_ce158 && m_ce158->respondsToRead(p, v)) return v;
-        if (m_ce150 && m_ce150->respondsToRead(p, v)) return v;
-        return 0xFF;
-    }
-    void cardWrite(uint16_t addr, bool me1, uint8_t value) {
-        if (!m_ce158 && !m_ce150) return;
-        const PinState p = peripheralPins(addr, /*forWrite=*/true, me1);
-        if (m_ce158 && m_ce158->respondsToWrite(p, value)) return;
-        if (m_ce150) m_ce150->respondsToWrite(p, value);
-    }
-
-    /// The CE-158's ME1 register blocks: LH5811 + UART 0xD000-0xD3FF,
-    /// interrupt-ID 0xDE00-0xDFFF (see Ce158Card).
-    static bool isCe158Io(uint16_t addr) {
-        return (addr >= Ce158Card::kPioBase && addr <= Ce158Card::kUartEnd) ||
-               (addr >= Ce158Card::kIntIdBase && addr <= Ce158Card::kIntIdEnd);
-    }
+    /// Offers an access to the cards on PC1600Memory::lh5803PeripheralBus().
+    /// True (with *value set, for a read) when a card claims it.
+    bool cardRead(uint16_t addr, bool me1, uint8_t* value) const;
+    bool cardWrite(uint16_t addr, bool me1, uint8_t value);
 
     PC1600Memory& m_shared;
     PC1600BusArbiter* m_arbiter{nullptr};
-    Ce150Card* m_ce150{nullptr};
-    Ce158Card* m_ce158{nullptr};
     LH5803Rom m_rom;
     std::array<uint8_t, 16> m_ioRegs{}; // internal LH5811-compat PIO, ME1 0xF000-0xF00F
     bool m_pv{false};

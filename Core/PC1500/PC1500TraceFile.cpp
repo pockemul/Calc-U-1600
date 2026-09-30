@@ -49,7 +49,7 @@ PC1500TraceFile::PC1500TraceFile(std::FILE* handle) : m_fh(handle) {
     h.u16(kVersion);
     h.u16(0);   // reserved (was "model" in Calc-U-59's v2 -- single model here)
     h.u64(0);   // reserved for future use
-    std::fwrite(header, 1, sizeof(header), m_fh);
+    m_bytesWritten += std::fwrite(header, 1, sizeof(header), m_fh);
 
     uint8_t payload[8];
     ByteSink s{payload};
@@ -65,14 +65,13 @@ void PC1500TraceFile::writeRecord(uint8_t type, const uint8_t* payload, uint16_t
     ByteSink h{recHeader};
     h.u8(type);
     h.u16(len);
-    std::fwrite(recHeader, 1, sizeof(recHeader), m_fh);
-    if (len) std::fwrite(payload, 1, len, m_fh);
+    m_bytesWritten += std::fwrite(recHeader, 1, sizeof(recHeader), m_fh);
+    if (len) m_bytesWritten += std::fwrite(payload, 1, len, m_fh);
 }
 
 void PC1500TraceFile::writeFrame(const CpuFrame& f) {
     if (!m_fh) return;
-    // 25-byte TRACE_EVENT payload -- field order MUST match
-    // TraceWriter.swift's makeFramePayload() and read_trace.py's
+    // 25-byte TRACE_EVENT payload -- field order MUST match read_trace.py's
     // `<IHHB BBBBBBB HB BBB H B` unpack (trailing B = cpuId, v2).
     uint8_t payload[25];
     ByteSink s{payload};
@@ -101,8 +100,7 @@ void PC1500TraceFile::writeFrame(const CpuFrame& f) {
 void PC1500TraceFile::writeFrame(const Z80CpuFrame& f) {
     if (!m_fh) return;
     // 29-byte TRACE_EVENT_Z80 payload -- field order MUST match
-    // TraceWriter.swift's makeZ80FramePayload() and read_trace.py's
-    // `<IHHBB HHHHHHH BBBBB` unpack.
+    // read_trace.py's `<IHHBB HHHHHHH BBBBB` unpack.
     uint8_t payload[29];
     ByteSink s{payload};
     s.u32(f.seqno);

@@ -84,6 +84,42 @@ keyboard layout.
 | `_` | Shift+`.` | — |
 | `\|` | Shift+`0` | — |
 
+## Accented characters (PC-1600)
+
+The PC-1600's `KB II` key latches, and while it is on the letters and
+`( )` give the characters below (ROM tables `KYCDKB2` / `KYCDSK2`, bank 6
+9592H / 95E5H; CP437 codes). A host character from this list is typed as
+`KB II`, [`SHIFT`,] key, `KB II`.
+
+| Key | KB II | SHIFT+KB II | | Key | KB II | SHIFT+KB II |
+|---|---|---|---|---|---|---|
+| A | á | á | | N | £ | ¥ |
+| B | ù | û | | O | Ñ | ñ |
+| C | ì | î | | P | Ç | ç |
+| D | í | í | | Q | Ä | ä |
+| E | ï | ï | | R | Ö | ö |
+| F | ó | ó | | S | É | é |
+| G | ú | ú | | T | Ü | ü |
+| H | ¡ | ½ | | U | Æ | æ |
+| I | Å | å | | V | ò | ô |
+| J | ¿ | ¼ | | W | ë | ë |
+| K | ª | ⌐ | | X | è | ê |
+| L | º | ¬ | | Y | ÿ | ÿ |
+| M | ¢ | ¢ | | Z | à | â |
+| ( | ₧ | « | | ) | ƒ | » |
+
+- **Host keys, paste and preset `type:`** all keep the case: `ä` gives
+  `ä`, `Ä` gives `Ä`. This is unlike the plain letters, which the host keys
+  type in uppercase. An uppercase the calculator lacks (`Ë`, `Û`) gives its
+  lowercase.
+- With `SHIFT` latched on the calculator, it is released first and the
+  character is typed as usual. With `KB II` latched, an accented host key
+  does nothing: press the letter itself instead (`R` gives `Ö`).
+- `SML` doesn't change these characters.
+- Dead keys compose as usual (`¨` then `U` gives `Ü` on a Swiss or German
+  layout, Option-U then U on a US Mac): the app takes part in the OS input
+  method and types the composed character.
+
 ## Modifiers
 
 - **macOS:** anything held with Cmd or Control never reaches the

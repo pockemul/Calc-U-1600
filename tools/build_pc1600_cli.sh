@@ -13,6 +13,7 @@ clang++ -std=c++17 -Wall -Wextra -O2 \
   Core/Preset/PresetFile.cpp \
   Core/Preset/PresetRunner.cpp \
   Core/MachineCodeFile.cpp \
+  Core/ProgramFile.cpp \
   Core/PC1500/PC1500Keyboard.cpp \
   Core/PC1500/PC1500TraceFile.cpp \
   Core/Audio/PiezoSampler.cpp \
@@ -26,11 +27,9 @@ clang++ -std=c++17 -Wall -Wextra -O2 \
   Core/PC1600/PC1600BasicTyper.cpp \
   Core/PC1600/PC1600BasicLoader.cpp \
   Core/PC1600/PC1600ProgramPlacement.cpp \
-  Core/PC1600/PC1600MachineImage.cpp \
   Core/PC1600/PC1600MachineCodeLoader.cpp \
   Core/PC1600/PC1600PresetLoader.cpp \
   Core/Display/LcdScreenshot.cpp \
-  Core/Basic/BasicBinaryImage.cpp \
   Core/Basic/BasicProgramSource.cpp \
   tools/pc1600_cli.cpp \
   Core/Basic/vendor/sharpdx/libsharpdx.a \

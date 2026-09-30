@@ -1,7 +1,8 @@
 #pragma once
-#include <algorithm>
 #include <cstdint>
 #include <vector>
+
+#include "CardChain.hpp"
 
 // ── PC-1600 60-pin system bus (CE-1600P and future peripherals) ──────────
 //
@@ -20,17 +21,21 @@
 // (ExpansionCard.hpp) -- it is just this bus's own pin vocabulary, not a
 // physical edge-connector contact list.
 //
-// Chain-capable from the start (attach/detach/chain(), mirroring
-// SystemBus.hpp's shape) even though only CE1600PCard exists today, so a
-// later peripheral (e.g. the CE-1600F floppy add-on that docks onto a
-// CE-1600P's own 50-pin sub-connector, or a from-scratch 60-pin device)
-// does not require a bus rewrite.
+// A chain (CardChain.hpp, the same shell as every other connector): the
+// CE-1600P and the CE-1600F both sit on it.
+//
+// This is only the SC7852 half of the PC-1600's one 60-pin plug; the
+// LH5803 half (CE-150, CE-158) is PC1600Memory::lh5803PeripheralBus(),
+// next to this bus in PC1600Memory. Merging the two into one connector
+// object with real 60-pin contacts waits on the open signal questions in
+// TODO.md ("Expansion connectors: one model on both machines").
 struct PC1600BusPins {
     uint16_t address = 0; // ROM offset (romRead) or I/O port number (io)
     bool forWrite = false;
     bool io = false;    // true = I/O port access (IN/OUT); false = ROM read
-    bool bank5 = false;  // Page B bank select for the ROM window: false =
-                          // bank 4, true = bank 5.
+    uint8_t bank = 0;   // Page B bank of the ROM window (4-7; 4/5 =
+                        // CE-1600P, 7 = PC1600HostDriveCard, any = a
+                        // preset's PC1600BusRomCard).
 };
 
 class PC1600ExpansionCard {
@@ -45,28 +50,21 @@ public:
 
 class PC1600SystemBus {
 public:
-    void attach(PC1600ExpansionCard* card) {
-        if (card && std::find(m_chain.begin(), m_chain.end(), card) == m_chain.end())
-            m_chain.push_back(card);
-    }
-    void detach(PC1600ExpansionCard* card) {
-        m_chain.erase(std::remove(m_chain.begin(), m_chain.end(), card), m_chain.end());
-    }
-    const std::vector<PC1600ExpansionCard*>& chain() const { return m_chain; }
+    void attach(PC1600ExpansionCard* card) { m_chain.attach(card); }
+    void attachFirst(PC1600ExpansionCard* card) { m_chain.attachFirst(card); }
+    void detach(PC1600ExpansionCard* card) { m_chain.detach(card); }
+    const std::vector<PC1600ExpansionCard*>& chain() const { return m_chain.cards(); }
 
-    /// Page B banks 4/5 ROM window (Z-80 4000-7FFF); `offset` is address
+    /// Page B banks 4-7 ROM window (Z-80 4000-7FFF); `offset` is address
     /// minus 0x4000. Consulted by PC1600Memory only when the page-B bank
-    /// register actually selects 4 or 5, i.e. exactly where PC1600Memory's
-    /// own resolveConst() already documents "deliberately left open bus
-    /// until CE-1600P itself is emulated."
-    bool readRom(uint16_t offset, bool bank5, uint8_t& outValue) const {
+    /// register selects one of the banks resolveConst() leaves to the
+    /// expansion connector (4/5 CE-1600P, 6, 7).
+    bool readRom(uint16_t offset, uint8_t bank, uint8_t& outValue) const {
         if (m_chain.empty()) return false;
         PC1600BusPins pins;
         pins.address = offset;
-        pins.bank5 = bank5;
-        for (PC1600ExpansionCard* card : m_chain)
-            if (card->respondsToRead(pins, outValue)) return true;
-        return false;
+        pins.bank = bank;
+        return m_chain.read(pins, outValue);
     }
 
     bool readIO(uint8_t port, uint8_t& outValue) const {
@@ -74,9 +72,7 @@ public:
         PC1600BusPins pins;
         pins.address = port;
         pins.io = true;
-        for (PC1600ExpansionCard* card : m_chain)
-            if (card->respondsToRead(pins, outValue)) return true;
-        return false;
+        return m_chain.read(pins, outValue);
     }
 
     bool writeIO(uint8_t port, uint8_t value) {
@@ -85,11 +81,9 @@ public:
         pins.address = port;
         pins.io = true;
         pins.forWrite = true;
-        for (PC1600ExpansionCard* card : m_chain)
-            if (card->respondsToWrite(pins, value)) return true;
-        return false;
+        return m_chain.write(pins, value);
     }
 
 private:
-    std::vector<PC1600ExpansionCard*> m_chain;
+    CardChain<PC1600ExpansionCard, PC1600BusPins> m_chain;
 };

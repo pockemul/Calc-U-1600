@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <filesystem>
 #include <cstdint>
 #include <fstream>
 #include <memory>
@@ -28,25 +29,16 @@ public:
         for (const Region& r : m_def.regions) {
             RegionState st;
             st.def = &r;
-            if (r.banked) {
-                st.backing.resize(size_t(r.banking.bankCount) * r.banking.bankSize);
-                for (uint32_t b = 0; b < r.banking.bankCount; b++) {
-                    auto it = r.initialContentByBank.find(b);
-                    if (it != r.initialContentByBank.end()) {
-                        std::copy(it->second.begin(), it->second.end(),
-                                  st.backing.begin() + size_t(b) * r.banking.bankSize);
-                    } else {
-                        uint8_t fill = r.contentForBank(b).powerUpFill;
-                        std::fill_n(st.backing.begin() + size_t(b) * r.banking.bankSize,
-                                   r.banking.bankSize, fill);
-                    }
-                }
-            } else {
-                auto it = r.initialContentByBank.find(0);
+            st.backing.resize(r.capacity);
+            for (uint32_t b = 0; b < r.banking.bankCount; b++) {
+                auto it = r.initialContentByBank.find(b);
                 if (it != r.initialContentByBank.end()) {
-                    st.backing = it->second;
+                    std::copy(it->second.begin(), it->second.end(),
+                              st.backing.begin() + size_t(b) * r.banking.bankSize);
                 } else {
-                    st.backing.assign(r.capacity, r.content.powerUpFill);
+                    uint8_t fill = r.contentForBank(b).powerUpFill;
+                    std::fill_n(st.backing.begin() + size_t(b) * r.banking.bankSize,
+                               r.banking.bankSize, fill);
                 }
             }
             m_regions.push_back(std::move(st));
@@ -64,7 +56,7 @@ public:
         return false;
     }
 
-    bool respondsToWrite(const PinState& pins, uint8_t value) override {
+    WriteResult respondsToWrite(const PinState& pins, uint8_t value) override {
         // 1. A port/pin write that latches a bank number.
         for (RegionState& st : m_regions) {
             if (!st.def->banked) continue;
@@ -72,42 +64,43 @@ public:
             if (b.triggerKind == TriggerKind::IoPort) {
                 if (pins.ioWrite && (pins.address & 0xFF) == b.triggerPort) {
                     st.bank = static_cast<int>(extractBits(value, b.sampledBits));
-                    return true;
+                    return WriteResult::taken();
                 }
             } else {  // TriggerKind::Pin -- a memory-write strobe
                 if (!pins.ioWrite && pins.pin[b.triggerPin]) {
                     st.bank = static_cast<int>(extractBits(pins.address, b.sampledBits));
-                    return true;
+                    return WriteResult::taken();
                 }
             }
         }
-        if (pins.ioWrite) return false;  // an I/O write that is not our trigger
+        if (pins.ioWrite) return WriteResult::ignored();  // an I/O write that is not our trigger
 
         // 2. A data write into a mapped slice.
         for (RegionState& st : m_regions) {
             uint32_t off;
             if (!locate(st, pins, &off)) continue;
             const Region& r = *st.def;
-            const RegionContent& c = r.contentForBank(r.banked ? uint32_t(st.bank) : 0);
+            const RegionContent& c = r.contentForBank(uint32_t(st.bank));
             // A mask ROM takes no write from anyone -- not even a host poke.
             // Claimed, so the bus doesn't fall through to open bus.
-            if (c.kind == ContentKind::Rom) return true;
+            if (c.kind == ContentKind::Rom) return WriteResult::refused();
             if (c.kind == ContentKind::Flash) {
                 if (pins.direct) {
-                    st.backing[off] = value;  // poke/preset loader: unconditional
-                    return true;
+                    store(st.backing[off], value);  // poke/preset loader: unconditional
+                    return WriteResult::taken();
                 }
                 // off = bank*bankSize + windowOffset (see locate()) -- the flash command
                 // decoder only ever sees the window-relative address.
-                uint32_t bankBase = r.banked ? uint32_t(st.bank) * r.banking.bankSize : 0;
+                uint32_t bankBase = uint32_t(st.bank) * r.banking.bankSize;
                 flashWrite(st, r, c.flash, off - bankBase, value);
-                return true;  // claimed even when the state machine leaves the array untouched
+                return WriteResult::taken();  // the chip took the command, even one that leaves the array untouched
             }
             bool protectedNow = c.hasWriteProtect && c.writeProtectDefaultProtected;
-            if (c.writable && !protectedNow) st.backing[off] = value;
-            return true;  // the card claims the write either way
+            if (!c.writable || protectedNow) return WriteResult::refused();  // the card claims the write either way
+            store(st.backing[off], value);
+            return WriteResult::taken();
         }
-        return false;
+        return WriteResult::ignored();
     }
 
     // Test-only introspection.
@@ -120,6 +113,8 @@ public:
     const MemoryCardDefinition& definition() const { return m_def; }
 
     std::string moduleName() const override { return m_def.moduleName; }
+
+    uint64_t contentRevision() const override { return m_contentRevision; }
 
     /// First banked region's current bank, for the GUI "Dump Mem" column
     /// label; -1 when no region banks (a purely unbanked definition).
@@ -168,6 +163,7 @@ public:
                 const size_t local = off - base;
                 const size_t take = std::min(n, st.backing.size() - local);
                 std::copy(data, data + take, st.backing.begin() + local);
+                ++m_contentRevision;
                 data += take;
                 n -= take;
                 off += take;
@@ -179,6 +175,14 @@ public:
     }
 
 private:
+    // Stores `value` into a backing cell, counting it as a content change
+    // only when the cell actually takes a new value (see contentRevision()).
+    void store(uint8_t& cell, uint8_t value) {
+        if (cell == value) return;
+        cell = value;
+        ++m_contentRevision;
+    }
+
     // Whether [off, off+n) of the concatenated backing (debugImage()'s
     // address space) touches a byte of a `rom` range.
     bool touchesRom(size_t off, size_t n) const {
@@ -188,7 +192,7 @@ private:
             const size_t regEnd = base + st.backing.size();
             const size_t lo = std::max(off, base), hi = std::min(off + n, regEnd);
             if (lo < hi) {
-                const size_t bankSize = r.banked ? r.banking.bankSize : st.backing.size();
+                const size_t bankSize = r.banking.bankSize;
                 for (size_t b = (lo - base) / bankSize; b <= (hi - 1 - base) / bankSize; ++b)
                     if (r.contentForBank(static_cast<uint32_t>(b)).kind == ContentKind::Rom) return true;
             }
@@ -302,8 +306,8 @@ private:
     // and returned from without touching `st.flash`: the command decoder
     // is its own state machine, independent of the bank-select latch, even
     // though real firmware interleaves writes to both in quick succession.
-    static void flashWrite(RegionState& st, const Region& r, const FlashProtocol& p,
-                           uint32_t windowOffset, uint8_t data) {
+    void flashWrite(RegionState& st, const Region& r, const FlashProtocol& p,
+                    uint32_t windowOffset, uint8_t data) {
         const uint32_t mask = p.commandAddressMask;
         const uint32_t cmd = windowOffset & mask;
         const uint32_t addr0 = p.unlockSequence[0].address & mask;
@@ -324,9 +328,9 @@ private:
         }
 
         using S = FlashDecoderState;
-        // An unbanked region is one "bank" of `capacity` bytes.
-        const uint32_t bankSize = r.banked ? r.banking.bankSize : r.capacity;
-        const uint32_t bankCount = r.banked ? r.banking.bankCount : 1;
+        // An unbanked region is one "bank" of `capacity` bytes (normalised at parse time).
+        const uint32_t bankSize = r.banking.bankSize;
+        const uint32_t bankCount = r.banking.bankCount;
         uint32_t bankBase = uint32_t(st.bank) * bankSize;
         switch (st.flash) {
             case S::Idle:
@@ -343,7 +347,8 @@ private:
                 else st.flash = S::Idle;
                 return;
             case S::ProgramArmed:
-                st.backing[bankBase + windowOffset] &= data;  // NOR: can only clear bits
+                store(st.backing[bankBase + windowOffset],
+                      uint8_t(st.backing[bankBase + windowOffset] & data));  // NOR: can only clear bits
                 st.flash = S::Idle;
                 return;
             case S::EraseSetup:
@@ -364,6 +369,7 @@ private:
                     uint32_t base = windowOffset & ~(p.sectorSize - 1);
                     std::fill_n(st.backing.begin() + bankBase + base, p.sectorSize, uint8_t(0xFF));
                 }
+                ++m_contentRevision;
                 st.flash = S::Idle;
                 return;
         }
@@ -371,6 +377,7 @@ private:
 
     MemoryCardDefinition m_def;
     std::vector<RegionState> m_regions;
+    uint64_t m_contentRevision = 0; // see contentRevision()
 };
 
 /// Build the universal card from a definition file for a specific target
@@ -390,7 +397,7 @@ inline std::unique_ptr<ExpansionCard> makeSoftwareDefinedCard(const std::string&
     ss << in.rdbuf();
 
     MemoryCardDefinition def;
-    if (!parseMemoryCardDefinition(ss.str(), &def, error)) {
+    if (!parseMemoryCardDefinition(ss.str(), &def, error, std::filesystem::path(specPath).parent_path().string())) {
         *error = "module spec '" + specPath + "': " + *error;
         return nullptr;
     }

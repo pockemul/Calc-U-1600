@@ -1,11 +1,11 @@
 #pragma once
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <map>
 #include <string>
 #include <vector>
 
+#include "../FileIO.hpp"
 #include "../PC1500/PC1500Machine.hpp"
 #include "../PC1600/PC1600Machine.hpp"
 
@@ -23,13 +23,6 @@ namespace BundledRoms {
 
 namespace detail {
 
-inline bool readWholeFile(const std::string& path, std::vector<uint8_t>* out) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return false;
-    out->assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-    return true;
-}
-
 // Bundled ROM bytes never change during a run, but switching models or
 // re-arming a preset re-resolves and re-reads every ROM file involved.
 // Cache by resolved path so repeated switches don't keep hitting disk.
@@ -41,7 +34,7 @@ inline bool readWholeFileCached(const std::string& path, std::vector<uint8_t>* o
         return true;
     }
     std::vector<uint8_t> bytes;
-    if (!readWholeFile(path, &bytes)) return false;
+    if (!::readWholeFile(path, &bytes)) return false;
     *out = bytes;
     cache.emplace(path, std::move(bytes));
     return true;
@@ -204,6 +197,25 @@ inline bool attachCE1600P(PC1600Machine& machine, const std::vector<std::string>
     }
     if (!machine.attachCE1600P(rom1.data(), rom1.size(), rom2.data(), rom2.size())) {
         if (error) *error = "CE-1600P attach failed -- " + version + " ROM size/shape rejected";
+        return false;
+    }
+    return true;
+}
+
+// Attaches Calc-U-1600's host-directory drive (S3: / Y:, PC1600HostDriveCard)
+// to a PC-1600, serving `dir`. The ROM is our own
+// (firmware/pc1600-hostdrive/), bundled next to the dumped ones.
+inline bool attachHostDrive(PC1600Machine& machine, const std::vector<std::string>& dirs,
+                            const std::filesystem::path& dir, std::string* error) {
+    std::string path;
+    std::vector<uint8_t> rom;
+    if (!resolveBundledRomPath(dirs, "PC1600-P1-B7-HOSTDRIVE.bin", &path, error) ||
+        !detail::readWholeFileCached(path, &rom)) {
+        if (error && error->empty()) *error = "could not read the host-drive ROM";
+        return false;
+    }
+    if (!machine.attachHostDrive(rom.data(), rom.size(), dir)) {
+        if (error) *error = "host-drive attach failed -- ROM size rejected";
         return false;
     }
     return true;

@@ -16,18 +16,30 @@ void PC1600Machine::resetLocked() {
     m_z80Mem.reset();
     m_z80Mem.keyboard().releaseAll();
     m_sc7852.reset();
-    m_onWakePending = false;
     m_lh5803.reset();
     m_arbiter.reset();
+    m_debugStop.clear();
     m_timer64Accum = 0;
     m_timer64State = false;
     m_timer64EdgeCount = 0;
-    m_rtcAccum = 0; // the clock value itself survives reset (see seedClock())
+    // m_rtcAccum is the sub-CPU's divider, which runs on the always-on rail:
+    // no reset or power cycle touches it (seedClock() sets its phase).
     m_z80Mem.setTimer64Bit(false);
     m_lh5803Mem.reset();                  // clear the internal-PIO register file (0xF00x)
     m_lh5803Mem.updatePUPV(false, false); // match the just-reset LH5803 CPU
     if (m_ce150Card) m_ce150Card->reset(); // re-anchor, keep it attached (like the CE-1600P)
-    if (m_ce158Card) m_ce158Card->reset();
+    m_ce158.reset();
+    // Any reset happens with power present.
+    m_z80Mem.subCpu().markSystemOn();
+}
+
+void PC1600Machine::powerOnLocked() {
+    // The sub-CPU switches VCC on and holds the SC-7852 in reset for 30 ms
+    // (Service Manual §6-3). RAM and the LCD's RAM kept their contents on
+    // VGG; the boot ROM finds its FA08H signature and resumes, or runs the
+    // WAKE$ command string, depending on the cause the sub-CPU reports
+    // (takePowerOnCause() has set it).
+    resetLocked();
 }
 
 void PC1600Machine::reset() {
@@ -46,6 +58,7 @@ void PC1600Machine::allReset() {
     // zeroed, settings to default.
     m_z80Mem.clearInternalRam();
     resetLocked();
+    m_z80Mem.subCpu().aclReset(); // ALL RESET is the sub-CPU's ACL pin too
     m_z80Mem.subCpu().setResetCauseAllReset();
 }
 
@@ -97,6 +110,55 @@ void PC1600Machine::detachCE1600PLocked() {
     if (!m_ce1600pCard) return;
     m_z80Mem.ce1600pBus().detach(m_ce1600pCard.get());
     m_ce1600pCard.reset();
+}
+
+bool PC1600Machine::attachHostDrive(const uint8_t* rom, size_t romSize, const std::filesystem::path& dir) {
+    auto card = std::make_unique<PC1600HostDriveCard>();
+    if (!card->loadRom(rom, romSize)) return false;
+    card->drive().setDirectory(dir);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    detachHostDriveLocked();
+    m_z80Mem.ce1600pBus().attach(card.get());
+    m_hostDriveCard = std::move(card);
+    return true;
+}
+
+void PC1600Machine::attachBusRom(std::unique_ptr<PC1600BusRomCard> card) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_z80Mem.ce1600pBus().attachFirst(card.get());
+    m_systemBusRoms.push_back(std::move(card));
+}
+
+void PC1600Machine::attachBusRom(std::unique_ptr<BusRomCard> card) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_z80Mem.lh5803PeripheralBus().attachFirst(card.get());
+    m_lh5803BusRoms.push_back(std::move(card));
+}
+
+void PC1600Machine::detachHostDrive() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    detachHostDriveLocked();
+}
+
+void PC1600Machine::detachHostDriveLocked() {
+    if (!m_hostDriveCard) return;
+    m_z80Mem.ce1600pBus().detach(m_hostDriveCard.get());
+    m_hostDriveCard.reset();
+}
+
+bool PC1600Machine::hostDriveAttached() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_hostDriveCard != nullptr;
+}
+
+void PC1600Machine::setHostDriveDirectory(const std::filesystem::path& dir) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_hostDriveCard) m_hostDriveCard->drive().setDirectory(dir);
+}
+
+std::filesystem::path PC1600Machine::hostDriveDirectory() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_hostDriveCard ? m_hostDriveCard->drive().directory() : std::filesystem::path{};
 }
 
 // The three below take m_mutex so the GUI thread can read/clear the
@@ -181,7 +243,7 @@ bool PC1600Machine::attachCE150(const uint8_t* rom, size_t romSize) {
     detachCE150Locked();
     detachCE1600PLocked(); // one plotter on the bus at a time
     card->reset();
-    m_lh5803Mem.attachCe150(card.get());
+    m_z80Mem.lh5803PeripheralBus().attach(card.get());
     m_ce150Card = std::move(card);
     return true;
 }
@@ -193,24 +255,20 @@ void PC1600Machine::detachCE150() {
 
 void PC1600Machine::detachCE150Locked() {
     if (!m_ce150Card) return;
-    m_lh5803Mem.detachCe150();
+    m_z80Mem.lh5803PeripheralBus().detach(m_ce150Card.get());
     m_ce150Card.reset();
 }
 
 // ── CE-158 interface (LH5803 side) ─────────────────────────────────────
 
 bool PC1600Machine::attachCE158(const uint8_t* rom, size_t romSize) {
-    if (romSize != Ce158Card::kRomSize) return false;
-    auto card = std::make_unique<Ce158Card>();
-    if (!card->loadRom(rom, romSize)) return false;
     std::lock_guard<std::mutex> lock(m_mutex);
+    auto card = m_ce158.build(rom, romSize, kTStateHz); // ticked with SC7852 T-states, see step()
+    if (!card) return false;
     detachCE158Locked();
     detachCE1600PLocked(); // not usable together with the CE-1600P
-    card->setClockHz(kTStateHz); // ticked with SC7852 T-states, see step()
-    card->reset();
-    card->setSerialLink(m_ce158Link);
-    m_lh5803Mem.attachCe158(card.get());
-    m_ce158Card = std::move(card);
+    m_z80Mem.lh5803PeripheralBus().attach(card.get());
+    m_ce158.install(std::move(card));
     return true;
 }
 
@@ -220,21 +278,19 @@ void PC1600Machine::detachCE158() {
 }
 
 void PC1600Machine::detachCE158Locked() {
-    if (!m_ce158Card) return;
-    m_lh5803Mem.detachCe158();
-    m_ce158Card.reset();
+    if (!m_ce158.attached()) return;
+    m_z80Mem.lh5803PeripheralBus().detach(m_ce158.card());
+    m_ce158.remove();
 }
 
 void PC1600Machine::setCE158SerialLink(SerialLink* link) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    m_ce158Link = link;
-    if (m_ce158Card) m_ce158Card->setSerialLink(link);
+    m_ce158.setSerialLink(link);
 }
 
 std::vector<uint8_t> PC1600Machine::drainCE158ParallelOutput() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_ce158Card) return {};
-    return m_ce158Card->drainParallelOutput();
+    return m_ce158.drainParallelOutput();
 }
 
 std::vector<AlpsPlotterMechanism::FlatPoint> PC1600Machine::ce150PlotPoints() const {
@@ -262,20 +318,39 @@ void PC1600Machine::clearCE150Paper() {
 
 int PC1600Machine::step() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    // An ON press resumes whichever CPU owns the bus from its next HALT
-    // (see setOnKeyPressed()). Held until then, so a press landing between
-    // the SC7852's OUT (38H) and its HALT still wakes the LH5803 it hands to.
-    if (m_onWakePending) {
-        if (m_arbiter.sc7852Owns() && m_sc7852.halted()) {
-            m_sc7852.resumeFromHalt();
-            m_onWakePending = false;
-        } else if (!m_arbiter.sc7852Owns() && m_lh5803.halted()) {
-            m_lh5803.wakeFromHalt();
-            m_onWakePending = false;
-        }
+    uint64_t tstates = 0;
+    return stepLocked(&tstates);
+}
+
+int PC1600Machine::stepLocked(uint64_t* tstates) {
+    *tstates = 0; // a step parked on a breakpoint takes no time
+    if (!m_z80Mem.subCpu().systemOn()) {
+        // No CPU has power. The sub-CPU's clock, timers and the peripherals
+        // with their own supply keep going; a power-on source ends it.
+        advanceSharedClocks(kOffSliceTStates);
+        *tstates = kOffSliceTStates;
+        if (m_z80Mem.subCpu().takePowerOnCause()) powerOnLocked();
+        return kOffSliceTStates;
+    }
+    // The sub-CPU cuts power once it has the OFF command (EAH) and PCTRL ->
+    // Q0 confirms. The CPU side of that is not documented; the ROM's OFF
+    // routine halts the LH-5803 right after sending EAH (rom1500 E553H),
+    // so a halted bus owner stands for it.
+    if (m_z80Mem.subCpu().powerOffCommanded() &&
+        (m_arbiter.sc7852Owns() ? m_sc7852.halted() : m_lh5803.halted())) {
+        m_z80Mem.subCpu().switchSystemOff();
+        advanceSharedClocks(kOffSliceTStates);
+        *tstates = kOffSliceTStates;
+        return kOffSliceTStates;
     }
     if (m_arbiter.sc7852Owns()) {
         int c = m_sc7852.step();
+        // Parked on a breakpoint: nothing executed, so no time passes.
+        if (c == 0 && m_sc7852.breakpointsEnabled() && m_sc7852.consumeBreakpointHit()) {
+            m_debugStop.latch(DebugStop::Breakpoint, 1);
+            return 0;
+        }
+        if (m_z80Watches && m_z80Watches->hitPending()) m_debugStop.latch(DebugStop::Watch, 1);
         // A halted SC7852::step() returns 0 (this core's convention for
         // "made no forward progress"), but real HALT still burns 4 T-states
         // per internal NOP cycle -- without crediting that, a CPU parked in
@@ -296,22 +371,18 @@ int PC1600Machine::step() {
             // see latchTimer64InterruptCause()). It latches whatever 35H
             // says (the ROM's ISR filters the 32H byte with 35H itself,
             // P1-B3 4102H/4112H); the mask only gates the INT level -- see
-            // PC1600Memory::updateIntLine().
+            // PC1600Memory::interruptLevel().
             if (!m_timer64State) m_z80Mem.latchTimer64InterruptCause();
-            // The sub-CPU's own aggregated interrupt line (INT6, cause bit
-            // 6), driven here by its 0.5s timer -- divided down from this
-            // same 64 Hz signal, see kTimer64EdgesPerHalfSecond.
+            // The sub-CPU's 0.5 s tick comes from the same divider as this
+            // 64 Hz signal, see kTimer64EdgesPerHalfSecond. It raises SRIRQ
+            // bit 1, and INT6 when the mask enables it.
             if (++m_timer64EdgeCount == kTimer64EdgesPerHalfSecond) {
                 m_timer64EdgeCount = 0;
-                // The sub-CPU's 0.5 s signal, visible in bit 1 of request
-                // 5DH, is a free-running level -- toggle it every period.
-                // The file/RAM-disk IOCS readiness handshake polls 5DH and
-                // waits for this to change.
-                m_z80Mem.subCpu().toggleHalfSecondSignal();
-                m_z80Mem.latchSubCpuInterruptCause();
+                m_z80Mem.subCpu().halfSecondTick();
             }
         }
         advanceSharedClocks(cost);
+        *tstates = static_cast<uint64_t>(cost);
         if (m_ce1600fCard) m_ce1600fCard->advance(static_cast<uint32_t>(cost));
         // The documented handoff is OUT (38H),A then HALT -- the write
         // sets the pending flag (PC1600Memory::writeIO), but the actual
@@ -325,6 +396,11 @@ int PC1600Machine::step() {
         return c;
     }
     int c = m_lh5803.step();
+    if (c == 0 && m_lh5803.breakpointsEnabled() && m_lh5803.consumeBreakpointHit()) {
+        m_debugStop.latch(DebugStop::Breakpoint, 2);
+        return 0;
+    }
+    if (m_lh5803Watches && m_lh5803Watches->hitPending()) m_debugStop.latch(DebugStop::Watch, 2);
     // Push the LH5803's post-instruction PU/PV so the next LH5803-side bus
     // access sees it (PV gates the CE-150 ROM window). Mirrors
     // PC1500Machine::step()'s updatePUPV for the LH5801.
@@ -332,10 +408,9 @@ int PC1600Machine::step() {
     // The LH-5803 also drives the UART / sub-CPU handshake (the OFF-path
     // clock save, rom1500 E538), and the calendar clock and buzzer keep
     // running while it owns the bus -- see advanceSharedClocks(). A halted
-    // step returns 0 and is charged LH5801::kHaltTickCycles, the same
-    // figure runCycles() budgets for it.
-    advanceSharedClocks(static_cast<int>(toTStates(
-        static_cast<uint64_t>(c > 0 ? c : LH5801::kHaltTickCycles), /*sc7852Owned=*/false)));
+    // step returns 0 and is charged LH5801::kHaltTickCycles.
+    *tstates = toTStates(static_cast<uint64_t>(c > 0 ? c : LH5801::kHaltTickCycles), /*sc7852Owned=*/false);
+    advanceSharedClocks(static_cast<int>(*tstates));
     // LH5803->SC7852: the STA #(0A038H) store is the whole handoff, so the
     // switch happens immediately after this step(). It raises cause bit 3,
     // and that INT ends the SC7852's HALT through the ROM's own handler
@@ -373,32 +448,22 @@ void PC1600Machine::advanceSharedClocks(int tstates) {
     m_z80Mem.uart().tick(tstates);
     m_z80Mem.subCpu().tickByTStates(tstates);
     m_z80Mem.display().tick(tstates);
-    if (m_ce158Card) m_ce158Card->tick(static_cast<uint64_t>(tstates)); // the CE-158's own UART clock
+    m_ce158.tick(static_cast<uint64_t>(tstates)); // the CE-158's own UART clock
 }
 
 uint64_t PC1600Machine::runCycles(uint64_t maxCycles) {
     uint64_t consumed = 0;
     while (consumed < maxCycles) {
-        // Sampled before step(), which may complete a pending handoff and
-        // hand the bus to the other CPU: the cost step() returns belongs to
-        // whichever CPU actually executed, i.e. the owner on entry.
-        const bool z80Owns = sc7852Owns();
-        const int c = step(); // takes m_mutex per step, as PC1500Machine does
-        // The halted-step fallback must match whichever CPU actually owned
-        // the bus -- step()'s own internal accounting (what its LH5803
-        // branch hands advanceSharedClocks(), which feeds m_rtcAccum among
-        // others) charges a halted LH5803 step LH5801::kHaltTickCycles raw
-        // LH5803 cycles, not SC7852::kHaltTickCycles. Using the
-        // SC7852 figure here regardless of owner would overcount this
-        // budget by ~5.5x during an OFF/auto-power-off span -- runCycles
-        // would then stop calling step() long before step()'s own
-        // m_rtcAccum had actually accumulated the requested amount of real
-        // elapsed time, so the calendar clock would lag during the very
-        // window m_rtcAccum's LH5803 branch (see step()) exists to cover.
-        const uint64_t cycles = static_cast<uint64_t>(
-            c > 0 ? c : (z80Owns ? SC7852::kHaltTickCycles : LH5801::kHaltTickCycles));
-        const uint64_t tstates = toTStates(cycles, z80Owns);
+        // The T-states step() charged the shared clocks, whichever CPU ran
+        // (or none, while powered off).
+        uint64_t tstates = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            stepLocked(&tstates);
+        }
+        if (m_debugStop.pending() == DebugStop::Breakpoint) break; // parked on a breakpoint: no time passed
         consumed += tstates;
+        if (m_debugStop.pending() == DebugStop::Watch) break; // the watched access's instruction has completed
         // See setYieldHook(). step() takes m_mutex per call, so it isn't
         // held here.
         if (m_yieldHook) {
@@ -434,65 +499,44 @@ void PC1600Machine::releaseKey(const std::string& name) {
 }
 void PC1600Machine::setOnKeyPressed(bool pressed) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    bool risingEdge = m_z80Mem.setOnKeyPressed(pressed);
-    // The ROM's auto-power-off / OFF-key power-down parks the SC7852 in a
-    // HALT with IFF1=1 but every *periodic* interrupt cause masked at port
-    // 35H (confirmed by a GUI freeze trace, 2026-09: last frame is
-    // `PC=5C22 OP=76` HALT, IFF1=1, reached right after an EI/RETI, and the
-    // 64 Hz key-scan and 0.5 s sub-CPU ticks this class would otherwise
-    // raise never fire again). Only the ON/BREAK line can wake it from
-    // there. `m_z80Mem.setOnKeyPressed()` just latches the pollable IF-b1
-    // bit (port 1BH) -- a HALTed CPU never polls it. ON has no port-32H
-    // cause bit, so it is not an SC7852 INT: a press sets m_onWakePending,
-    // and step() resumes whichever CPU owns the bus from its next HALT (it
-    // then polls the latch); the parked one is left for the arbiter. This
-    // is a stand-in -- the documented sources do not say how the real ON
-    // line ends a HALT (sub-CPU INT6, NMI and clock gating are all
-    // candidates), so resuming directly skips any ISR a real wake might
-    // run. Rising edge only, matching the latch and a real PB7 edge.
-    // After power-down settles the bus usually belongs to the LH5803, halted
-    // at 0xE555 (the SC7852 handed off at 5C1F before its own HALT); the
-    // LH5803's requestMaskableInterrupt() is IE-gated and IE is clear
-    // there, so its wake is wakeFromHalt(), the unconditional counterpart.
-    //
-    // Only a press that finds the bus owner halted, or the SC7852 between
-    // its OUT (38H) and HALT, is a wake. A press while the owner runs is a
-    // BREAK the ROM reads from the latch; kept pending, it would wake the
-    // machine from its next power-down park.
-    if (!risingEdge) return;
-    const bool ownerHalted = m_arbiter.sc7852Owns() ? m_sc7852.halted() : m_lh5803.halted();
-    if (ownerHalted || m_arbiter.switchRequestedBySC7852()) m_onWakePending = true;
+    // The ON/BREAK line: the SC-7852 sees its debounced level on PB7 and
+    // the latch at 1BH (BREAK), and the sub-CPU sees it on KH, where a
+    // rising edge powers a switched-off system on (Service Manual §9-3).
+    // step() does the power-on at its next call.
+    const bool risingEdge = m_z80Mem.setOnKeyPressed(pressed);
+    if (risingEdge) m_z80Mem.subCpu().onKeyPressed(); // ignored while the system is on
 }
 
 bool PC1600Machine::pokeMemory(uint16_t address, const uint8_t* data, size_t size) {
     std::lock_guard<std::mutex> lock(m_mutex);
     // All-or-nothing: reject ROM / open bus up front, then write through
     // the host path (poke(): flash takes the byte directly instead of via
-    // its command decoder) and read every byte back. isWritable() can't
-    // see inside a card -- any region that answers a read passes it, even
-    // one that drops the write (mask ROM, read-only RAM) -- so a byte that
-    // didn't stick puts the old contents back and fails the call.
+    // its command decoder). isWritable() can't see inside a card -- any
+    // region that answers a read passes it, even one that drops the write
+    // (mask ROM, read-only RAM) -- so a byte poke() reports as not stored
+    // puts the bytes written so far back and fails the call.
     std::vector<uint8_t> old(size);
     for (size_t i = 0; i < size; i++) {
         uint16_t addr = static_cast<uint16_t>(address + i); // wraps at 0xFFFF, matching real Z-80 address arithmetic
         if (!m_z80Mem.isWritable(addr)) return false;
         old[i] = m_z80Mem.read(addr);
     }
-    bool stuck = true;
     for (size_t i = 0; i < size; i++) {
-        uint16_t addr = static_cast<uint16_t>(address + i);
-        m_z80Mem.poke(addr, data[i]);
-        if (m_z80Mem.read(addr) != data[i]) stuck = false;
+        if (m_z80Mem.poke(static_cast<uint16_t>(address + i), data[i])) continue;
+        for (size_t j = 0; j < i; j++) m_z80Mem.poke(static_cast<uint16_t>(address + j), old[j]);
+        return false;
     }
-    if (stuck) return true;
-    for (size_t i = 0; i < size; i++) m_z80Mem.poke(static_cast<uint16_t>(address + i), old[i]);
-    return false;
+    return true;
 }
 
 uint8_t PC1600Machine::debugPeek(uint16_t addr) {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_z80Mem.peek(addr);
 }
+
+bool PC1600Machine::mode1() { return (debugPeek(0xF1BC) & 0x40) != 0; }
+
+int PC1600Machine::programAreaTitle() { return debugPeek(0xF1D5); }
 
 bool PC1600Machine::debugSc7852Owns() {
     std::lock_guard<std::mutex> lock(m_mutex);

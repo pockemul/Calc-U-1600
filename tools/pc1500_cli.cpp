@@ -6,28 +6,30 @@
 //     repeating loop (the idle loop signature — this build does not decode
 //     the dot-matrix LCD's pixel format, so "idle" is inferred structurally
 //     rather than by reading displayed text),
-//   - a demonstration of the trace ring buffer and a breakpoint actually
-//     halting execution.
+//   - a demonstration of the trace ring buffer.
 //
 // Usage: pc1500_cli <rom-file> [maxCycles]
-//        pc1500_cli --preset <preset-file.pc1500> [maxCycles] [--modules-dir <dir>] [--wav <out.wav>]
+//        pc1500_cli --preset <preset-file.pc1500> [maxCycles] [--modules-dir <dir>] [--wav <out.wav>] [--lcd-png <out.png>]
 //
 // The --preset form parses and applies a `.pc1500` scenario file
 // (PresetFile.hpp/PC1500PresetLoader.hpp) instead of a bare ROM --
-// firmware, pre-load-keys, program load, and post-load-keys are all
-// driven from the preset before falling into the same run loop below.
+// the model, modules, `keys:` and `program:` blocks are all driven
+// from the preset before falling into the same run loop below.
 //
-// --modules-dir <dir> is a directory a preset's `- modulespec:
-// <module-name>` memory-expansion reference is looked up in (default
-// `Calc-U-1600/Resources`, the repo's bundled-module directory -- same
+// --modules-dir <dir> is a directory a preset's `slot-1: <module-name>`
+// reference is looked up in (default
+// `Qt6/resources/cards`, the repo's bundled-module directory -- same
 // cwd-relative convention as `roms/`). Repeat it to add fallback
 // directories, searched in the order given after the first. A
-// `- modulespecfile: <path>` reference ignores it.
+// `slot-1-file: <path>` reference ignores it.
+//
+// --lcd-png <out.png> writes the LCD, as Copy Screen does, at the end of
+// the run.
 //
 // --wav <out.wav> records the buzzer (PC6, see PiezoSampler.hpp) for the
 // whole run -- preset script included -- as 48 kHz mono 16-bit PCM.
 //
-// CE-158 (a preset with `interface: ce158`):
+// CE-158 (a preset with `interface: CE-158`):
 //   --ce158-pty       attach a host PTY as the RS-232C peer; its stable
 //                     symlink is ~/Library/Application Support/Calc-U-1600/
 //                     calcu1600-ce158.serial (path printed on stderr).
@@ -51,22 +53,29 @@
 #include "../Core/PC1500/PC1500Machine.hpp"
 #include "../Core/Preset/PresetFile.hpp"
 #include "../Core/PC1500/PC1500PresetLoader.hpp"
+#include "../Core/PC1500/PC1500Screenshot.hpp"
 #include "Ce158CliPeer.hpp"
+#include "CliCommon.hpp"
 
 int main(int argc, char** argv) {
     // Pull an optional `--modules-dir <dir>` out of argv up front so the
     // rest of the parsing keeps its simple fixed positions.
-    std::string moduleDir = "Calc-U-1600/Resources";
+    std::string moduleDir = "Qt6/resources/cards";
     std::vector<std::string> extraModuleDirs;  // 2nd+ `--modules-dir`, searched after `moduleDir`
     bool moduleDirSet = false;
     bool dumpBasic = false;
     std::string wavPath;
+    std::string lcdPng;
     Ce158CliPeer ce158Peer;
     {
         std::vector<char*> kept;
         for (int i = 0; i < argc; ++i) {
             if (std::strcmp(argv[i], "--wav") == 0 && i + 1 < argc) {
                 wavPath = argv[++i];
+                continue;
+            }
+            if (std::strcmp(argv[i], "--lcd-png") == 0 && i + 1 < argc) {
+                lcdPng = argv[++i];
                 continue;
             }
             if (std::strcmp(argv[i], "--modules-dir") == 0 && i + 1 < argc) {
@@ -87,7 +96,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s <rom-file> [maxCycles]\n", argv[0]);
         std::fprintf(stderr, "       %s --preset <preset-file.pc1500> [maxCycles]\n", argv[0]);
-        std::fprintf(stderr, "       options: --modules-dir <dir>  --dump-basic  --wav <out.wav>\n");
+        std::fprintf(stderr, "       options: --modules-dir <dir>  --dump-basic  --wav <out.wav>  --lcd-png <out.png>\n");
         std::fprintf(stderr, "                %s\n", Ce158CliPeer::kUsage);
         return 1;
     }
@@ -121,7 +130,7 @@ int main(int argc, char** argv) {
     // BREAK, and any post-load-keys -- is traced too, not just whatever
     // the tail loop executes afterward. That script is usually the whole
     // point of a debug preset.
-    machine.setTraceFlags(TRACE_PC | TRACE_REGS_LIGHT | TRACE_BREAKPOINTS);
+    machine.setTraceFlags(TRACE_PC | TRACE_REGS_LIGHT);
 
     // --wav: drain the buzzer audio as the run goes (the sampler only
     // buffers ~1 s). The yield hook covers the preset script's own
@@ -174,10 +183,6 @@ int main(int argc, char** argv) {
         uint16_t pcBefore = machine.cpu().pc();
         int c = machine.step();
         if (c == 0) {
-            if (machine.consumeBreakpointHit()) {
-                std::printf("breakpoint hit at PC=0x%04X after %llu cycles\n", pcBefore, (unsigned long long)consumed);
-                break;
-            }
             if (machine.cpu().halted()) {
                 std::printf("CPU halted (HLT) at PC=0x%04X after %llu cycles with no pending interrupt\n", pcBefore, (unsigned long long)consumed);
                 break;
@@ -204,6 +209,13 @@ int main(int argc, char** argv) {
     }
 
     std::printf("Ran %llu instructions, %llu cycles\n", (unsigned long long)steps, (unsigned long long)consumed);
+    if (!lcdPng.empty()) {
+        std::string pngError;
+        if (!writeLcdScreenshotPng(pc1500LcdBitmap(machine), kPC1500ScreenMm, lcdPng, &pngError)) {
+            std::fprintf(stderr, "failed to write '%s': %s\n", lcdPng.c_str(), pngError.c_str());
+            return 1;
+        }
+    }
 
     // Convergence signal: an idle loop revisits a small set of addresses a
     // large number of times. Report the most-visited PC and how many
@@ -303,15 +315,7 @@ int main(int argc, char** argv) {
 
     if (!ce158Peer.report(machine)) return 1;
 
-    if (machine.ce150Attached()) {
-        auto pts = machine.ce150PlotPoints();
-        std::printf("CE-150: attached, plot points=%zu revision=%llu\n",
-                    pts.size(), static_cast<unsigned long long>(machine.ce150PlotRevision()));
-        auto events = machine.drainCE150Events();
-        std::printf("CE-150 events (%zu):\n", events.size());
-        for (size_t i = 0; i < events.size() && i < 60; ++i)
-            std::printf("  %s\n", events[i].c_str());
-    }
+    cli::printCe150Report(machine);
 
     return 0;
 }

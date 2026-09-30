@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -102,6 +103,9 @@ void test_display_ic2_command_and_data() {
 // written controller goes busy; 50H-53H writes hit both.
 void test_display_busy_after_write() {
     PC1600Display d;
+    d.setClockEnabled(true);
+    d.writeIO(0x50, 0x3F);               // both on, so the status byte is only busy
+    d.tick(70);
     CHECK(d.readIO(0x59) == 0x00);
     CHECK(d.readIO(0x55) == 0x00);
     d.writeIO(0x5A, 0x81);               // IC2 data write
@@ -119,6 +123,36 @@ void test_display_busy_after_write() {
     CHECK(d.readIO(0x55) == 0x00);
 }
 
+// Without CK0 (port 37H bit 4) the HD61102s get no phi clock, so busy
+// cannot clear; it clears 4 edges after the clock comes back.
+void test_display_busy_holds_while_clock_off() {
+    PC1600Display d;
+    d.writeIO(0x5A, 0x81);
+    d.tick(10'000);
+    CHECK((d.readIO(0x59) & 0x80) != 0);
+    d.setClockEnabled(true);
+    d.tick(49);
+    CHECK((d.readIO(0x59) & 0x80) != 0);
+    d.tick(18);
+    CHECK((d.readIO(0x59) & 0x80) == 0);
+}
+
+// Status DB5 = ON/OFF, 1 = display off (the reverse of the instruction's
+// D bit); DB4 (RESET) stays clear.
+void test_display_status_reports_on_off() {
+    PC1600Display d;
+    d.setClockEnabled(true);
+    CHECK(d.readIO(0x59) == 0x20);      // off after power-on
+    CHECK(d.readIO(0x55) == 0x20);
+    d.writeIO(0x58, 0x3F);              // IC2 on
+    d.tick(70);
+    CHECK(d.readIO(0x59) == 0x00);
+    CHECK(d.readIO(0x55) == 0x20);      // IC3 still off
+    d.writeIO(0x58, 0x3E);
+    d.tick(70);
+    CHECK(d.readIO(0x59) == 0x20);
+}
+
 void test_display_ic3_column_offset() {
     PC1600Display d;
     // Port block 0x54-0x57 = IC3-only, columns 64-127 of the panel.
@@ -130,12 +164,11 @@ void test_display_ic3_column_offset() {
     CHECK(!d.pixel(0, 0)); // IC2 untouched
 }
 
-void test_display_read_lags_one_column() {
-    // See PC1600Display.cpp's dataByte() comment: a read returns the byte
-    // at addressCol-1, not addressCol, matching the HD61102's own dummy-read
-    // behavior. Without this lag, the ROM's cursor-blink read-modify-write
-    // would read the wrong column, corrupting the cell a little more on
-    // every blink.
+void test_display_read_returns_output_register() {
+    // See PC1600Display.cpp's dataByte() comment: a read returns the
+    // output register, which the previous read loaded, then reloads it
+    // from the current address. The first read after setting an address
+    // is the dummy read the ROM discards (bank 6 81E8H).
     PC1600Display d;
     d.writeIO(0x58, 0x3F);       // display on
     d.writeIO(0x58, 0xB8);       // page 0
@@ -143,11 +176,23 @@ void test_display_read_lags_one_column() {
     d.writeIO(0x5A, 0x11);       // write column 0 = 0x11, pointer -> column 1
     d.writeIO(0x5A, 0x22);       // write column 1 = 0x22, pointer -> column 2
     d.writeIO(0x58, 0x40);       // re-home: set column 0
-    // First read after a column-address-set is stale (lags by one) --
-    // real hardware's dummy-read behavior.
-    CHECK(d.readIO(0x5B) == 0x00); // pointer was 0 -> lagged col = 63 (untouched, still 0)
-    CHECK(d.readIO(0x5B) == 0x11); // pointer now 1 -> lagged col = 0
-    CHECK(d.readIO(0x5B) == 0x22); // pointer now 2 -> lagged col = 1
+    CHECK(d.readIO(0x5B) == 0x00); // dummy: output register still empty
+    CHECK(d.readIO(0x5B) == 0x11); // column 0
+    CHECK(d.readIO(0x5B) == 0x22); // column 1
+
+    // A write between reads does not touch the output register: the next
+    // read still returns what the previous read latched (column 2 = 0).
+    d.writeIO(0x58, 0x42);       // column 2
+    (void)d.readIO(0x5B);        // dummy, latches column 2 (0x00)
+    d.writeIO(0x58, 0x42);
+    d.writeIO(0x5A, 0x33);       // column 2 = 0x33
+    CHECK(d.readIO(0x5B) == 0x00); // stale latch, not 0x33
+
+    // A page change is the same: the latch keeps the old page's byte.
+    d.writeIO(0x58, 0x40);
+    (void)d.readIO(0x5B);        // latches page 0 column 0 (0x11)
+    d.writeIO(0x58, 0xB9);       // page 1
+    CHECK(d.readIO(0x5B) == 0x11);
 }
 
 /// A round-trip read-modify-write, exactly the shape of the ROM's own
@@ -295,7 +340,8 @@ void test_display_status_symbols_wired_to_ic3_column63() {
     CHECK(d.statusLine().isOn(Symbol::S));
     CHECK(d.statusLine().isOn(Symbol::Batt));
     CHECK(!d.statusLine().isOn(Symbol::Ctrl));
-    CHECK(!d.statusLine().isOn(Symbol::Kbii));
+    CHECK(!d.statusLine().isOn(Symbol::Romaji));
+    CHECK(!d.statusLine().isOn(Symbol::Kana));
 }
 
 // A "display off" command (0x3E) to IC3 must also blank the status-symbol
@@ -480,30 +526,32 @@ void test_memory_pb5_survives_opb_read_modify_write() {
 
 // ── PC1600SubCpu (LU-57813P) ──────────────────────────────────────────
 
+// The values below are what the Z-80 writes to port 21H: the complement of
+// the sub-CPU operand (PC1600SubCpu's class comment). Operands in brackets.
 void test_subcpu_requests_answer_on_port33() {
     PC1600Bank bank;
     PC1600Memory mem(bank);
     auto& bus = static_cast<SC7852Bus&>(mem);
 
-    // 5AH: the first request the main CPU issues -> A0H.
+    // 5AH [A5H, IOCS 15H]: the reset cause, the first request -> A0H.
     bus.writeIO(0x21, 0x5A);
     CHECK(mem.subCpu().answerPending());
     CHECK(bus.readIO(0x33) == 0xA0);
     CHECK(!mem.subCpu().answerPending());
 
-    // 57H (main supply) / 55H (CE-1600P pack): both must clear the ROM's
+    // 57H [A8H SRA0, main supply] / 55H [AAH SRA2, CE-1600P pack]: both must clear the ROM's
     // low-battery thresholds (AFH and A8H respectively).
     bus.writeIO(0x21, 0x57);
     CHECK(bus.readIO(0x33) == 0xC0);
     bus.writeIO(0x21, 0x55);
     CHECK(bus.readIO(0x33) == 0xC0);
 
-    // 56H answers the injected analog reading.
+    // 56H [A9H SRA1] answers the injected analog reading.
     mem.subCpu().setAnalogInput(0x7B);
     bus.writeIO(0x21, 0x56);
     CHECK(bus.readIO(0x33) == 0x7B);
 
-    // 5CH: bit5 = CI low (no serial peripheral), bit2 = password stored.
+    // 5CH [A3H SRINP]: bit5 = CI not asserted, bit2 = password stored.
     bus.writeIO(0x21, 0x5C);
     CHECK(bus.readIO(0x33) == 0x20);
 
@@ -520,8 +568,8 @@ void test_subcpu_nibble_stack_clock_roundtrip() {
     auto& bus = static_cast<SC7852Bus&>(mem);
 
     // Set the clock to 09-25 14:37:52 by pushing nine nibbles (each sent
-    // one's-complemented in its low nibble: 0x cmd resets the stack and
-    // pushes, 7x pushes) and committing with action 6DH.
+    // as its complement: 0x = F0H+n starts the block, 7x = 80H+n appends)
+    // and committing with 6DH [92H SWRT].
     const uint8_t nib[9] = {0x09, 0x2, 0x5, 0x1, 0x4, 0x3, 0x7, 0x5, 0x2};
     bus.writeIO(0x21, static_cast<uint8_t>(0x00 | (0x0F - nib[0])));
     for (int i = 1; i < 9; i++) {
@@ -548,8 +596,8 @@ void test_subcpu_nibble_stack_clock_roundtrip() {
     CHECK(dt.hour == 0x14);    // untouched
     CHECK(dt.second == 0x01);  // rewritten
 
-    // Read the clock back the way BASIC's `TIME` does: action 6CH publishes
-    // the nine nibbles, then one 6FH ("pop") per nibble moves each into the
+    // Read the clock back the way BASIC's `TIME` does: 6CH [93H SRRT] publishes
+    // the nine nibbles, then one 6FH [90H fetch] per nibble moves each into the
     // answer register for the following IN A,(33H). Expected clock now:
     // month 09, day 25, 14:37:01.
     const uint8_t want[9] = {0x09, 0x2, 0x5, 0x1, 0x4, 0x3, 0x7, 0x0, 0x1};
@@ -642,7 +690,7 @@ void test_subcpu_interrupt_mask_and_password() {
     PC1600Memory mem(bank);
     auto& bus = static_cast<SC7852Bus&>(mem);
 
-    // 5FH builds the SC-7852 interrupt mask from the first two nibbles.
+    // 5FH [A0H SWMSK] builds the interrupt mask from the first two nibbles.
     bus.writeIO(0x21, static_cast<uint8_t>(0x00 | (0x0F - 0x0A)));
     bus.writeIO(0x21, static_cast<uint8_t>(0x70 | (0x0F - 0x05)));
     bus.writeIO(0x21, 0x5F);
@@ -650,7 +698,7 @@ void test_subcpu_interrupt_mask_and_password() {
     bus.writeIO(0x21, 0x5E);            // read it back
     CHECK(bus.readIO(0x33) == 0xA5);
 
-    // 65H stores a password; 5CH then reports bit2 set alongside bit5.
+    // 65H [9AH, IOCS 0AH] stores a password; 5CH then reports bit2 set alongside bit5.
     CHECK(!mem.subCpu().passwordSet());
     bus.writeIO(0x21, static_cast<uint8_t>(0x00 | (0x0F - 0x07)));
     bus.writeIO(0x21, 0x65);
@@ -670,52 +718,115 @@ void test_memory_intmask_reads_back_via_port35() {
     CHECK(mem.intMask() == 0x01);
 }
 
-void test_kbii_segment_is_panel_driven_not_mode_driven() {
+// The romaji->kana caption is on commons X35 / X59 (Service Manual glass
+// pinout): page 4 bit 2 and page 7 bit 2 of IC3 column 63. KBII's bit 7
+// has no electrode, and the KBII mode flag in RAM must not light anything.
+void test_romaji_kana_segments_follow_the_glass_pinout() {
     PC1600Bank bank;
     PC1600Memory mem(bank);
     auto& bus = static_cast<SC7852Bus&>(mem);
     using Symbol = PC1600StatusLine::Symbol;
-    CHECK(!mem.display().statusLine().isOn(Symbol::Kbii));
-
-    // Kbii is panel bit 7 of symbol set 2 (IC3 column 63, page 4) -- a real
-    // segment, independent of S at bit 3.
     bus.writeIO(0x54, 0x3F);        // display on
-    bus.writeIO(0x54, 0xB8 | 4);    // page 4
     bus.writeIO(0x54, 0x40 | 63);   // column 63
-    bus.writeIO(0x56, 0x80);        // kana bit only
-    CHECK(mem.display().statusLine().isOn(Symbol::Kbii));
+
+    bus.writeIO(0x54, 0xB8 | 4);    // page 4
+    bus.writeIO(0x56, 0x04);        // bit 2 = X35
+    CHECK(mem.display().statusLine().isOn(Symbol::Romaji));
+    CHECK(!mem.display().statusLine().isOn(Symbol::Kana));
     CHECK(!mem.display().statusLine().isOn(Symbol::S));
 
     bus.writeIO(0x54, 0x40 | 63);
-    bus.writeIO(0x56, 0x08);        // S bit only -- what this ROM actually writes
-    CHECK(!mem.display().statusLine().isOn(Symbol::Kbii));
-    CHECK(mem.display().statusLine().isOn(Symbol::S));
+    bus.writeIO(0x56, 0x80);        // bit 7 (KBII): no electrode
+    CHECK(!mem.display().statusLine().isOn(Symbol::Romaji));
+    CHECK(!mem.display().statusLine().isOn(Symbol::Kana));
+    CHECK(!mem.display().statusLine().isOn(Symbol::S));
 
-    // The KBII *mode* flag lives in RAM (F3C6H bit 7) and must not reach
-    // the segment: on a western unit the ROM only ever folds KBII into S,
-    // never drives the kana legend directly from the mode flag.
-    mem.write(0xF3C6, 0x80);
-    CHECK(!mem.display().statusLine().isOn(Symbol::Kbii));
+    bus.writeIO(0x54, 0xB8 | 7);    // page 7
+    bus.writeIO(0x54, 0x40 | 63);
+    bus.writeIO(0x56, 0x04);        // bit 2 = X59
+    CHECK(mem.display().statusLine().isOn(Symbol::Kana));
+    CHECK(!mem.display().statusLine().isOn(Symbol::Busy));
+    CHECK(!mem.display().statusLine().isOn(Symbol::Small));
+
+    mem.write(0xF3C6, 0x84);        // RAM shadow only
+    bus.writeIO(0x54, 0xB8 | 4);
+    bus.writeIO(0x54, 0x40 | 63);
+    bus.writeIO(0x56, 0x00);
+    CHECK(!mem.display().statusLine().isOn(Symbol::Romaji));
 }
 
 void test_subcpu_interrupt_cause_bit6() {
     PC1600Bank bank;
     PC1600Memory mem(bank);
     auto& bus = static_cast<SC7852Bus&>(mem);
-    // Bit 0 is the TC8576F's live INT output (TxRDY on a reset chip), not
-    // part of the latch under test here.
-    auto latched = [&] { return static_cast<uint8_t>(bus.readIO(0x32) & 0xFE); };
+    auto& sub = mem.subCpu();
+    auto cause6 = [&] { return static_cast<uint8_t>(bus.readIO(0x32) & 0x40); };
 
-    // Masked off (35H bit6 = 0): the cause still latches; only INT is gated.
-    bus.writeIO(0x35, 0x10);        // only the 1/64s timer unmasked
-    mem.latchSubCpuInterruptCause();
-    CHECK(latched() == 0x40);
-    CHECK(latched() == 0x00); // read-clears, same as bit4's convention
+    // Bit 6 is the sub-CPU's Z7: pending events its own mask enables.
+    // Without SWMSK the 0.5 s tick stays pending but raises nothing.
+    sub.halfSecondTick();
+    CHECK(cause6() == 0x00);
+    // SWMSK 02H (5FH [A0H] after the nibbles 0, 2, sent complemented).
+    bus.writeIO(0x21, 0x0F);
+    bus.writeIO(0x21, 0x7D);
+    bus.writeIO(0x21, 0x5F);
+    CHECK(cause6() == 0x40);
+    CHECK(cause6() == 0x40);              // a level: a 32H read doesn't clear it
 
-    // Both causes can be pending at once without disturbing each other.
-    mem.latchTimer64InterruptCause();
-    mem.latchSubCpuInterruptCause();
-    CHECK(latched() == 0x50);
+    // SRIRQ (5DH [A2H]) returns the pending bits and clears them, which
+    // drops the line (Service Manual §4-3).
+    bus.writeIO(0x21, 0x5D);
+    CHECK(bus.readIO(0x33) == 0x02);
+    CHECK(cause6() == 0x00);
+    bus.writeIO(0x21, 0x5D);
+    CHECK(bus.readIO(0x33) == 0x00);
+
+    // A masked-off event is reported by SRIRQ too, and cleared with it.
+    sub.tickOneSecond();                  // 1 s bit, not in the mask
+    CHECK(cause6() == 0x00);
+    bus.writeIO(0x21, 0x5D);
+    CHECK(bus.readIO(0x33) == 0x04);
+}
+
+// SWA1T / SRA1T (96H / 97H) store and read back a timer; at the minute
+// carry that matches it, the sub-CPU raises its SRIRQ bit. '?' fields are
+// sent as F nibbles and match anything (SubCpu §7.3).
+void test_subcpu_timer_store_readback_and_match() {
+    PC1600Bank bank;
+    PC1600Memory mem(bank);
+    auto& sub = mem.subCpu();
+    auto send = [&](std::initializer_list<uint8_t> nibbles, uint8_t exec) {
+        bool first = true;
+        for (uint8_t n : nibbles) {
+            sub.strobe(static_cast<uint8_t>((first ? 0xF0 : 0x80) | n));
+            first = false;
+        }
+        sub.strobe(exec);
+    };
+    sub.setDateTime({0x09, 0x26, 0x13, 0x29, 0x58});
+    // ON TIME$ = "??/??/13/30" (month F, day FF, 13:30, seconds sent too).
+    send({0xF, 0xF, 0xF, 0x1, 0x3, 0x3, 0x0, 0x0, 0x0}, 0x96);
+    sub.strobe(0x97);
+    const uint8_t want[7] = {0xF, 0xF, 0xF, 0x1, 0x3, 0x3, 0x0};
+    for (uint8_t w : want) { sub.strobe(0x90); CHECK(sub.readAnswer() == w); }
+
+    sub.strobe(0xA2); (void)sub.readAnswer();
+    sub.tickOneSecond();                  // 13:29:59
+    CHECK((sub.pendingInterrupts() & PC1600SubCpu::kIrqAlarm1) == 0);
+    sub.tickOneSecond();                  // 13:30:00 -- match
+    CHECK((sub.pendingInterrupts() & PC1600SubCpu::kIrqAlarm1) != 0);
+
+    // A cleared timer (month 0, SINIT's default) never fires.
+    send({0x0, 0, 0, 0, 0, 0, 0, 0, 0}, 0x98);
+    sub.strobe(0xA2); (void)sub.readAnswer();
+    for (int i = 0; i < 120; i++) sub.tickOneSecond();
+    CHECK((sub.pendingInterrupts() & PC1600SubCpu::kIrqAlarm2) == 0);
+
+    // WAKE$(0) at an exact date and time.
+    sub.setDateTime({12, 0x25, 0x07, 0x29, 0x59}); // month is plain binary
+    send({0xC, 0x2, 0x5, 0x0, 0x7, 0x3, 0x0, 0x0, 0x0}, 0x94);
+    sub.tickOneSecond();
+    CHECK((sub.pendingInterrupts() & PC1600SubCpu::kIrqWakeUp) != 0);
 }
 
 void test_pb3_reads_high_for_the_alternate_charset_gate() {
@@ -761,6 +872,14 @@ void test_memory_clock_enable_via_port37_write() {
     CHECK(!mem.display().clockEnabled());
     static_cast<SC7852Bus&>(mem).writeIO(0x37, 0x10); // bit4 set
     CHECK(mem.display().clockEnabled());
+    // Reset clears port 37H, so CK0 stops; the LCD RAM stays (VGG).
+    static_cast<SC7852Bus&>(mem).writeIO(0x58, 0x3F);
+    static_cast<SC7852Bus&>(mem).writeIO(0x58, 0xB8);
+    static_cast<SC7852Bus&>(mem).writeIO(0x58, 0x40);
+    static_cast<SC7852Bus&>(mem).writeIO(0x5A, 0x01);
+    mem.reset();
+    CHECK(!mem.display().clockEnabled());
+    CHECK(mem.display().pixel(0, 0));
 }
 
 } // namespace
@@ -804,7 +923,7 @@ int run_pc1600_keyboard_display_tests() {
     test_keyboard_rsv_matrix_position();
     test_keyboard_no_keys_pressed_is_all_ones();
     test_display_ic2_command_and_data();
-    test_display_read_lags_one_column();
+    test_display_read_returns_output_register();
     test_display_cursor_style_read_modify_write_roundtrip();
     test_display_ic3_column_offset();
     test_display_off_reads_as_blank();
@@ -814,6 +933,8 @@ int run_pc1600_keyboard_display_tests() {
     test_display_status_symbols_blank_when_ic3_display_off();
     test_display_clock_enable_flag();
     test_display_busy_after_write();
+    test_display_busy_holds_while_clock_off();
+    test_display_status_reports_on_off();
     test_statusline_defaults_all_off();
     test_statusline_set_and_read();
     test_statusline_reset_clears_all();
@@ -827,8 +948,9 @@ int run_pc1600_keyboard_display_tests() {
     test_subcpu_host_seed_survives_cold_init();
     test_subcpu_interrupt_mask_and_password();
     test_memory_intmask_reads_back_via_port35();
-    test_kbii_segment_is_panel_driven_not_mode_driven();
+    test_romaji_kana_segments_follow_the_glass_pinout();
     test_subcpu_interrupt_cause_bit6();
+    test_subcpu_timer_store_readback_and_match();
     test_pb3_reads_high_for_the_alternate_charset_gate();
     test_memory_display_wiring_via_io();
     test_memory_clock_enable_via_port37_write();

@@ -67,58 +67,101 @@ const SlotGeometry& geomForSlot(const PlacementInput& in, int slot) {
 uint16_t internalCeiling(const PlacementInput& in) {
     uint16_t vp = peekBE(in, kVarPtr);
     if (vp >= 0x4000 && vp < 0x7000) {
-        uint16_t z = static_cast<uint16_t>(vp + 0x8000);
+        uint16_t z = lh5803ToZ80(vp);
         if (z > kInternalBase && z <= kWorkAreaBase)
             return static_cast<uint16_t>(z - 1);
     }
     return static_cast<uint16_t>(kWorkAreaBase - 1);  // $EFFF
 }
 
-// Walk the (payload + $FF marker) byte stream across `segments`, emitting
-// one contiguous PlacementWrite per segment touched. Fills startAddr /
-// endAddr. Errors if the stream runs off the last segment.
-bool placeImage(PlacementResult& r, size_t payloadLen) {
-    const size_t total = payloadLen + 1;  // + terminating $FF
+// Lay the program's line records down across `segments` the way the ROM's
+// LOAD does (LOADSTORE, rom3b 7074H):
+//  - Where one segment runs straight on into the next in Z-80 addresses
+//    (ADTBL entry 5's module bank -> internal RAM at $C000), the program
+//    simply continues; a line may straddle that seam.
+//  - At any other segment end (module bank -> next module bank) lines don't
+//    straddle: a line is stored only if 2 bytes stay free after it
+//    (addr + record + 2 <= top). Otherwise the ROM writes a two-byte
+//    bank-end mark 00 00 and carries on at the next bank's base.
+//  - In the last segment the same test decides between storing and "out of
+//    memory".
+// The $FF end mark follows the last line. Fills writes / startAddr /
+// endAddr / endSegment.
+bool placeImage(PlacementResult& r, const std::vector<uint8_t>& payload) {
     const auto& segs = r.segments;
+    // Split into line records: [lineNo hi][lineNo lo][len][len bytes]. A lone
+    // $FF is the end mark between two program segments (a `#SEGMENT` /
+    // `99999` line in a listing); LOADLINE (rom3b 6F70H) makes it a 1-byte
+    // record that LOADSTORE places like any line. A saved file carries it as
+    // FF 00 00 (line 0 can't exist); LOADLINE reads all three, stores the FF.
+    std::vector<std::pair<size_t, size_t>> records;  // offset, size
+    for (size_t i = 0; i < payload.size();) {
+        if (payload[i] == 0xFF) {
+            records.push_back({i, 1});
+            const bool wire = i + 2 < payload.size() && payload[i + 1] == 0x00 && payload[i + 2] == 0x00;
+            i += wire ? 3 : 1;
+            continue;
+        }
+        if (i + 3 > payload.size() || i + 3 + payload[i + 2] > payload.size()) {
+            r.error = "the tokenized program is malformed (a line record runs past its end)";
+            return false;
+        }
+        const size_t size = 3u + payload[i + 2];
+        records.push_back({i, size});
+        i += size;
+    }
 
     size_t seg = 0;
     uint32_t addr = segs[0].base;
     r.startAddr = segs[0].base;
 
-    size_t runStartSrc = 0;
-    uint32_t runStartAddr = addr;
-    size_t runLen = 0;
-    auto flush = [&]() {
-        if (runLen == 0) return;
+    // Byte output: extend the current write while it stays in one segment.
+    auto put = [&](uint8_t byte) {
+        while (addr > segs[seg].top) {  // only across a contiguous seam
+            ++seg;
+        }
         const ProgramSegment& s = segs[seg];
-        PlacementWrite w;
-        w.kind = s.kind;
-        w.slot = s.slot;
-        w.backingOffset = s.backingBase + (runStartAddr - s.base);
-        w.sourceOffset = runStartSrc;
-        w.length = runLen;
-        r.writes.push_back(w);
-        runLen = 0;
+        if (r.writes.empty() || r.writes.back().segment != seg ||
+            r.writes.back().backingOffset + r.writes.back().data.size() != s.backingBase + (addr - s.base)) {
+            PlacementWrite w;
+            w.kind = s.kind;
+            w.slot = s.slot;
+            w.segment = seg;
+            w.backingOffset = s.backingBase + (addr - s.base);
+            r.writes.push_back(w);
+        }
+        r.writes.back().data.push_back(byte);
+        ++addr;
+    };
+    // The last segment of the run the current segment belongs to (contiguous seams merged).
+    auto runEnd = [&](size_t k) {
+        while (k + 1 < segs.size() && uint32_t(segs[k].top) + 1 == segs[k + 1].base) ++k;
+        return k;
     };
 
-    for (size_t i = 0; i < total; ++i) {
-        if (addr > segs[seg].top) {
-            flush();
-            if (++seg >= segs.size()) {
+    for (const auto& rec : records) {
+        for (;;) {
+            const size_t last = runEnd(seg);
+            if (addr + rec.second + 2 <= segs[last].top) break;
+            if (last + 1 >= segs.size()) {
                 r.error = "program too large for the user area";
                 return false;
             }
+            put(0x00);  // bank-end mark
+            put(0x00);
+            seg = last + 1;
             addr = segs[seg].base;
         }
-        if (runLen == 0) {
-            runStartAddr = addr;
-            runStartSrc = i;
-        }
-        ++runLen;
-        if (i + 1 == total) r.endAddr = static_cast<uint16_t>(addr);
-        ++addr;
+        for (size_t i = 0; i < rec.second; ++i) put(payload[rec.first + i]);
     }
-    flush();
+    if (addr > segs[runEnd(seg)].top) {
+        r.error = "program too large for the user area";
+        return false;
+    }
+    while (addr > segs[seg].top) ++seg;
+    r.endAddr = static_cast<uint16_t>(addr);
+    r.endSegment = seg;
+    put(0xFF);
     return true;
 }
 
@@ -129,7 +172,8 @@ bool placeImage(PlacementResult& r, size_t payloadLen) {
 // otherwise segment 0 starts at window_base + 197 (a program-module region).
 PlacementResult buildPlacement(const PlacementInput& in, int firstIdx, int lastIdx,
                                bool appendInternal, bool leadingBaseFromBasPrgSt,
-                               size_t payloadLen) {
+                               const std::vector<uint8_t>& payload, uint16_t regionStart = 0,
+                               uint8_t regionLimitPage = 0) {
     PlacementResult r;
     r.basPrgStValue = peekBE(in, kBasPrgSt);
 
@@ -161,6 +205,7 @@ PlacementResult buildPlacement(const PlacementInput& in, int firstIdx, int lastI
             s.kind = ProgramSegment::Kind::SlotModule;
             s.slot = slot;
             s.adtblBank = bank;
+            s.adtblIndex = n;
             s.base = windowBase(g);
             s.windowBase = s.base;
             s.top = kSlotWindowTop;
@@ -185,7 +230,7 @@ PlacementResult buildPlacement(const PlacementInput& in, int firstIdx, int lastI
     // Segment 0's true start.
     ProgramSegment& seg0 = r.segments.front();
     if (leadingBaseFromBasPrgSt) {
-        uint32_t z = static_cast<uint32_t>(r.basPrgStValue) + 0x8000u;
+        uint32_t z = lh5803ToZ80(r.basPrgStValue);
         if (z < seg0.base || z > seg0.top)
             return fail("BASPRG_ST ($F865=" + hex(r.basPrgStValue, 4) +
                         ") lands outside the first S0 segment " + hex(seg0.base, 4) + ".." +
@@ -193,11 +238,19 @@ PlacementResult buildPlacement(const PlacementInput& in, int firstIdx, int lastI
         seg0.backingBase += static_cast<uint16_t>(z) - seg0.base;
         seg0.base = static_cast<uint16_t>(z);
     } else {
-        seg0.backingBase += kHeaderReserve;
-        seg0.base = static_cast<uint16_t>(seg0.base + kHeaderReserve);
+        // A program-module region: the descriptor's start, when it lies in
+        // the leading bank's window past the header; else window + 197.
+        uint16_t start = static_cast<uint16_t>(seg0.base + kHeaderReserve);
+        if (regionStart >= start && regionStart <= seg0.top) start = regionStart;
+        seg0.backingBase += static_cast<uint16_t>(start - seg0.base);
+        seg0.base = start;
+        // The descriptor's limit page ends the last bank (C0H = the whole window).
+        ProgramSegment& last = r.segments.back();
+        if (regionLimitPage > (last.base >> 8) && regionLimitPage < 0xC0)
+            last.top = static_cast<uint16_t>((regionLimitPage << 8) - 1);
     }
 
-    if (!placeImage(r, payloadLen))
+    if (!placeImage(r, payload))
         return r;  // r.error set, r.ok stays false
 
     r.ok = true;
@@ -206,18 +259,33 @@ PlacementResult buildPlacement(const PlacementInput& in, int firstIdx, int lastI
 
 }  // namespace
 
-PlacementResult planS0Placement(const PlacementInput& in, size_t payloadLen) {
+PlacementResult planS0Placement(const PlacementInput& in, const std::vector<uint8_t>& payload) {
     int s0mtb = in.peek(kS0MTb);
     int s1mtb = in.peek(kS1MTb);
     int s2mtb = in.peek(kS2MTb);
 
     PlacementResult r = buildPlacement(in, s0mtb, 5, /*appendInternal=*/true,
-                                       /*leadingBaseFromBasPrgSt=*/true, payloadLen);
+                                       /*leadingBaseFromBasPrgSt=*/true, payload);
     r.programModuleCase = (s1mtb >= 1 && s1mtb <= 5) || (s2mtb >= 1 && s2mtb <= 5);
     return r;
 }
 
-PlacementResult planModuleRegionPlacement(const PlacementInput& in, int slot, size_t payloadLen) {
+SlotDescriptor readSlotDescriptor(const std::function<uint8_t(uint16_t)>& peek, int slot) {
+    const uint16_t d = slotDescriptorAddress(slot);
+    auto at = [&](int off) { return peek(static_cast<uint16_t>(d + off)); };
+    SlotDescriptor s;
+    s.basePage = at(0);
+    s.mtb = at(1);
+    s.limitPage = at(2);
+    s.limitIndex = at(3);
+    s.start = static_cast<uint16_t>(at(4) | (at(5) << 8));
+    s.startIndex = at(6);
+    s.end = static_cast<uint16_t>(at(7) | (at(8) << 8));
+    s.endIndex = at(9);
+    return s;
+}
+
+PlacementResult planModuleRegionPlacement(const PlacementInput& in, int slot, const std::vector<uint8_t>& payload) {
     const uint16_t mtbAddr = slot == 2 ? kS2MTb : kS1MTb;
     const uint16_t mbbAddr = slot == 2 ? kS2MBb : kS1MBb;
     int mtb = in.peek(mtbAddr);
@@ -226,8 +294,9 @@ PlacementResult planModuleRegionPlacement(const PlacementInput& in, int slot, si
         return fail("slot " + std::to_string(slot) + " is not currently a BASIC program module (" +
                     (slot == 2 ? "S2MTb" : "S1MTb") + " is not a 1..5 index)");
 
+    const SlotDescriptor desc = readSlotDescriptor(in.peek, slot);
     PlacementResult r = buildPlacement(in, mtb, mbb, /*appendInternal=*/false,
-                                       /*leadingBaseFromBasPrgSt=*/false, payloadLen);
+                                       /*leadingBaseFromBasPrgSt=*/false, payload, desc.start, desc.limitPage);
     r.programModuleCase = true;
     return r;
 }

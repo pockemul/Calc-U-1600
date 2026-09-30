@@ -1,13 +1,13 @@
 #!/bin/sh
 # Builds the headless PC-1600 + CE-1600P plotter probe. Boots a
-# `plotter: ce1600p` preset, runs its script, and dumps the plotter
+# `plotter: CE-1600P` preset, runs its script, and dumps the plotter
 # mechanism's pen/motor/colour events per preset step. Investigation aid
 # for the "pen colour drifts out of sync on OFF/ON" issue -- see
 # MinorIssues.md.
 #
 # Usage:
 #   tools/build_pc1600_plotter_probe.sh && \
-#     ./headless/pc1600_plotter_probe examples/plotter_test.pc1600
+#     ./headless/pc1600_plotter_probe examples/plotter/ce1600p-text-and-frame.pc1600
 set -e
 cd "$(dirname "$0")/.."
 mkdir -p headless
@@ -22,6 +22,7 @@ clang++ -std=c++17 -Wall -Wextra -O1 \
   Core/Preset/PresetFile.cpp \
   Core/Preset/PresetRunner.cpp \
   Core/MachineCodeFile.cpp \
+  Core/ProgramFile.cpp \
   Core/PC1500/PC1500BasicTyper.cpp \
   Core/PC1500/PC1500PresetLoader.cpp \
   Core/PC1500/PC1500TraceFile.cpp \
@@ -35,11 +36,9 @@ clang++ -std=c++17 -Wall -Wextra -O1 \
   Core/CPU/LH5803/LH5803SharedMemory.cpp \
   Core/PC1600/PC1600Machine.cpp \
   Core/PC1600/PC1600BasicTyper.cpp \
-  Core/PC1600/PC1600MachineImage.cpp \
   Core/PC1600/PC1600MachineCodeLoader.cpp \
   Core/PC1600/PC1600PresetLoader.cpp \
   Core/Display/LcdScreenshot.cpp \
-  Core/Basic/BasicBinaryImage.cpp \
   Core/Basic/BasicProgramSource.cpp \
   Core/PC1500/PC1500BasicLoader.cpp \
   Core/PC1600/PC1600BasicLoader.cpp \

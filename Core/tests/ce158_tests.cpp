@@ -270,6 +270,44 @@ void test_machine_decode_alongside_internal_io() {
     CHECK(machine.memory().peek(0x8000) == 0xFF);
 }
 
+// The debugger's ME1 peeks ask the cards (readHasSideEffects) instead of
+// knowing their address ranges: a register a read would disturb stays
+// unread, only while that card is plugged in, on both hosts.
+void test_debug_peek_skips_card_registers() {
+    auto rom = fakeRom();
+    std::vector<uint8_t> ce150(Ce150Card::kRomSize, 0x5A);
+    bool readable = true;
+
+    PC1500Machine pc1500(PC1500Variant::PC1500A);
+    pc1500.memory().debugPeekME1(0xB008, &readable);
+    CHECK(readable);                                   // no CE-150: plain ME1 address
+    pc1500.memory().debugPeekME1(0xD200, &readable);
+    CHECK(readable);                                   // no CE-158 either
+    CHECK(pc1500.attachCE150(ce150.data(), ce150.size()));
+    CHECK(pc1500.attachCE158(rom.data(), rom.size()));
+    pc1500.memory().debugPeekME1(0xB008, &readable);
+    CHECK(!readable);                                  // the CE-150's LH5810
+    pc1500.memory().debugPeekME1(0xD200, &readable);
+    CHECK(!readable);                                  // the CE-158's UART
+    pc1500.memory().debugPeekME1(0xDE00, &readable);
+    CHECK(!readable);                                  // the CE-158's interrupt-ID register
+    pc1500.memory().debugPeekME1(0xF00C, &readable);
+    CHECK(readable);                                   // the internal LH5811 is still peekable
+
+    PC1600Machine pc1600;
+    auto& lh = pc1600.lh5803Memory();
+    lh.debugPeek(0xD200, /*me1=*/true, &readable);
+    CHECK(readable);                                   // no CE-158: LH5803 ROM alias
+    CHECK(pc1600.attachCE158(rom.data(), rom.size()));
+    lh.debugPeek(0xD200, /*me1=*/true, &readable);
+    CHECK(!readable);
+    lh.debugPeek(0xD400, /*me1=*/true, &readable);
+    CHECK(readable);                                   // just past the CE-158's blocks
+    pc1600.detachCE158();
+    lh.debugPeek(0xD200, /*me1=*/true, &readable);
+    CHECK(readable);
+}
+
 const char* kSysRom = "roms/PC-1500_A04.ROM";
 const char* kCe150Rom = "roms/CE-150.ROM";
 const char* kCe158Rom = "roms/CE-158.ROM";
@@ -299,7 +337,7 @@ void test_preset_parse_interface_key() {
     CHECK(loadPreset("model: PC-1500A\ninterface: CE-158\n", &p));
     CHECK(p.interfaceName == "ce158");
     PresetFile none;
-    CHECK(loadPreset("model: PC-1500\ninterface: none\n", &none));
+    CHECK(loadPreset("model: PC-1500\n", &none));
     CHECK(none.interfaceName.empty());
     PresetFile bad;
     CHECK(!loadPreset("model: PC-1500A\ninterface: ce-999\n", &bad));
@@ -311,9 +349,9 @@ void test_rom_lprint_centronics_with_ce150_chained() {
     if (!haveRoms(__func__)) return;
     PresetFile preset;
     CHECK(loadPreset(
-        "model: PC-1500A:A04\nplotter: ce150\ninterface: ce158\n"
+        "model: PC-1500A:A04\nplotter: CE-150\ninterface: CE-158\n"
         "keys:\n  - key: cl\n  - type: NEW0\n"
-        "program:\n  format: basic-text\n  text: |\n"
+        "program:\n  text: |\n"
         "    10 OPN \"LPRT\"\n    20 LPRINT \"HELLO CE-158\"\n    30 OPN\n    40 LPRINT \"CE150\"\n"
         "keys:\n  - key: cl\n  - key: mode\n  - type: RUN\n  - wait:\n",
         &preset));
@@ -335,9 +373,9 @@ void test_rom_serial_lprint_and_input() {
     if (!haveRoms(__func__)) return;
     PresetFile preset;
     CHECK(loadPreset(
-        "model: PC-1500A:A04\ninterface: ce158\n"
+        "model: PC-1500A:A04\ninterface: CE-158\n"
         "keys:\n  - key: cl\n  - type: NEW0\n"
-        "program:\n  format: basic-text\n  text: |\n"
+        "program:\n  text: |\n"
         "    10 SETDEV PO\n    20 OUTSTAT 0\n    30 LPRINT \"SERIAL OUT\"\n"
         "    40 SETDEV KI\n    50 INPUT A$\n    60 SETDEV\n    70 OPN \"LPRT\":LPRINT \"GOT \";A$\n"
         "keys:\n  - key: cl\n  - key: mode\n  - type: RUN\n",
@@ -410,9 +448,9 @@ void test_pc1600_ce158_and_ce1600p_exclusive() {
     CHECK(m.ce158Attached() && !m.ce1600pAttached());
 
     PresetFile p;
-    CHECK(!loadPreset("model: PC-1600\nplotter: ce1600p\ninterface: ce158\n", &p));
+    CHECK(!loadPreset("model: PC-1600\nplotter: CE-1600P\ninterface: CE-158\n", &p));
     PresetFile ok;
-    CHECK(loadPreset("model: PC-1600\nplotter: ce150\ninterface: ce158\n", &ok));
+    CHECK(loadPreset("model: PC-1600\nplotter: CE-150\ninterface: CE-158\n", &ok));
     CHECK(ok.interfaceName == "ce158" && ok.plotter == "ce150");
 }
 
@@ -423,9 +461,9 @@ bool havePC1600Roms(const char* test) {
 }
 
 std::string pc1600Preset(const std::string& program) {
-    return "model: PC-1600\ninterface: ce158\n"
+    return "model: PC-1600\ninterface: CE-158\n"
            "keys:\n  - key: mode\n  - type: NEW\n  - type: MODE1\n"
-           "program:\n  format: basic-text\n  text: |\n" + program +
+           "program:\n  text: |\n" + program +
            "keys:\n  - key: mode\n  - type: RUN\n";
 }
 
@@ -488,6 +526,7 @@ int run_ce158_tests() {
     test_uart_transmit_paced_by_baud();
     test_uart_receive_never_overruns();
     test_machine_decode_alongside_internal_io();
+    test_debug_peek_skips_card_registers();
     test_preset_parse_interface_key();
     test_rom_lprint_centronics_with_ce150_chained();
     test_rom_serial_lprint_and_input();

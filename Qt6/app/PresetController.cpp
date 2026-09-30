@@ -1,11 +1,24 @@
 #include "PresetController.hpp"
 
+#include <QDebug>
 #include <functional>
+#include <vector>
 
+#include "AppPaths.hpp"
+#include "AppSettings.hpp"
+#include "FloppyDiskManager.hpp"
+#include "HostClock.hpp"
+#include "MachineController.hpp"
+#include "MemoryModuleManager.hpp"
+#include "PC1500/PC1500BasicLoader.hpp"
 #include "PC1500/PC1500Machine.hpp"
 #include "PC1500/PC1500MachineCodeLoader.hpp"
+#include "PC1500/PC1500PresetLoader.hpp"
+#include "PC1600/PC1600BasicLoader.hpp"
 #include "PC1600/PC1600Machine.hpp"
 #include "PC1600/PC1600MachineCodeLoader.hpp"
+#include "PC1600/PC1600PresetLoader.hpp"
+#include "Preset/PresetFile.hpp"
 
 namespace {
 
@@ -82,60 +95,12 @@ bool PresetController::loadMachineCodeLive(const MachineCodeLoadRequest& request
     return ok;
 }
 
-#ifdef CALCU1600_PRESET_LOADER_AVAILABLE
-
-#include "MachineController.hpp"
-#include "MemoryModuleManager.hpp"
-#include "FloppyDiskManager.hpp"
-#include "AppPaths.hpp"
-#include "AppSettings.hpp"
-
-#include <QDebug>
-#include <vector>
-
-#include "Preset/PresetFile.hpp"
-#include "PC1500/PC1500PresetLoader.hpp"
-#include "PC1500/PC1500Machine.hpp"
-#include "PC1500/PC1500BasicLoader.hpp"
-#include "PC1600/PC1600PresetLoader.hpp"
-#include "PC1600/PC1600Machine.hpp"
-#include "PC1600/PC1600BasicLoader.hpp"
-#include "Basic/BasicProgramSource.hpp"
-#include "HostClock.hpp"
-
 namespace {
 
 Model modelForPreset(const PresetFile& preset) {
     if (preset.isPC1600()) return Model::PC1600;
     return preset.variant == PC1500Variant::PC1500A ? Model::PC1500A : Model::PC1500;
 }
-
-// Live-machine LOAD: mirrors real hardware LOAD semantics, not NEW+type. No
-// reset, no mode change, no NEW0 typed here -- the user is expected to have
-// already prepared the machine themselves (memory cards, `NEW`, mode,
-// peripherals), exactly as they would before typing LOAD on a real machine.
-// loadBasicBinaryPayload() validates whatever BASPRG_ST/BASPRG_END are
-// currently live, erases the resident program between them, and pokes the
-// new one in from BASPRG_ST -- see its own header doc comment.
-template <class Machine>
-bool loadBasicProgramLiveOn(Machine& machine, basic::TransferModel model, const std::string& path,
-                            QString* error) {
-    basic::BasicProgramSource src = basic::readBasicProgramSource(path, model);
-    if (!src.ok) {
-        *error = QString::fromStdString(src.error);
-        return false;
-    }
-    BasicLoadResult loaded = loadBasicBinaryPayload(machine, src.payload);
-    if (!loaded.ok) {
-        *error = QString::fromStdString(loaded.error);
-        return false;
-    }
-    return true;
-}
-
-}  // namespace
-
-namespace {
 
 bool parsePreset(const QString& path, PresetFile* preset, QString* error) {
     std::string parseError;
@@ -148,9 +113,11 @@ bool parsePreset(const QString& path, PresetFile* preset, QString* error) {
 
 }  // namespace
 
-bool PresetController::loadPreset(const QString& path, QString* error) {
+bool PresetController::loadPreset(const QString& path, QString* error, bool armOnly) {
     PresetFile preset;
-    return parsePreset(path, &preset, error) && runPreset(preset, error);
+    if (!parsePreset(path, &preset, error)) return false;
+    preset.armOnly = armOnly;
+    return runPreset(preset, error);
 }
 
 bool PresetController::loadDefaultPreset(const QString& path, Model model, QString* error) {
@@ -166,22 +133,23 @@ bool PresetController::loadDefaultPreset(const QString& path, Model model, QStri
 namespace {
 
 // Preset `saveas:` dispatch -- shared by the PC-1600 and PC-1500 branches
-// below (the PC-1500 side only ever sees SaveAsTarget::S1, per
+// below (the PC-1500 side only ever sees SaveAsTarget::Slot1, per
 // PresetFile.cpp's per-model validation).
 bool saveAsFromPreset(MemoryModuleManager* moduleManager, FloppyDiskManager* floppyManager,
-                       PresetStep::SaveAsTarget target, const std::string& name, std::string* error) {
+                      const PresetSaveAsRequest& request, std::string* error) {
     QString qerror;
-    const QString qname = QString::fromStdString(name);
+    const QString qname = QString::fromStdString(request.name);
+    const QString qpath = QString::fromStdString(request.path);
     bool ok = false;
-    switch (target) {
-        case PresetStep::SaveAsTarget::S1:
-            ok = moduleManager->saveAsFromPreset(1, qname, &qerror);
+    switch (request.target) {
+        case PresetStep::SaveAsTarget::Slot1:
+            ok = moduleManager->saveAsFromPreset(1, qname, qpath, request.isTemplate, &qerror);
             break;
-        case PresetStep::SaveAsTarget::S2:
-            ok = moduleManager->saveAsFromPreset(2, qname, &qerror);
+        case PresetStep::SaveAsTarget::Slot2:
+            ok = moduleManager->saveAsFromPreset(2, qname, qpath, request.isTemplate, &qerror);
             break;
         case PresetStep::SaveAsTarget::Floppy:
-            ok = floppyManager->saveAsFromPreset(qname, &qerror);
+            ok = floppyManager->saveAsFromPreset(qname, qpath, request.isTemplate, &qerror);
             break;
     }
     if (!ok && error) *error = qerror.toStdString();
@@ -190,101 +158,37 @@ bool saveAsFromPreset(MemoryModuleManager* moduleManager, FloppyDiskManager* flo
 
 }  // namespace
 
-bool PresetController::runPreset(const PresetFile& preset, QString* error) {
+struct PresetController::PresetEnv {
+    std::vector<std::string> romDirs;
+    std::string moduleDir;
+    std::vector<std::string> extraModuleDirs;
+    std::string traceDir;
+    PresetLogFn log;
+    PresetSaveAsFn onSaveAs;
+};
 
+bool PresetController::runPreset(const PresetFile& preset, QString* error) {
     // Bundled catalog first, then the user's writable instance directory --
     // the same order MemoryModuleManager's own attachOneSlot() uses, so a
-    // preset's `- modulespec: <name>` resolves identically to the live
+    // preset's `slot-N: <name>` resolves identically to the live
     // module picker. The same bundled directory also holds the ROM images
     // Core/Resources/BundledRomCatalog.hpp resolves by name.
+    PresetEnv env;
     const std::string bundledDir = AppPaths::bundledResourcesDir().toStdString();
-    const std::vector<std::string> romDirs = {bundledDir};
-    const std::string moduleDir = bundledDir;
-    const std::vector<std::string> extraModuleDirs = {AppPaths::instanceDir().toStdString()};
+    env.romDirs = {bundledDir};
+    env.moduleDir = bundledDir;
+    env.extraModuleDirs = {AppPaths::instanceDir().toStdString()};
     // `- trace:` and `- screenshot:` steps write into the Settings trace
     // directory, falling back to the instance directory (always present and
     // writable) -- the same resolution DebugPanel's trace capture uses.
     const QString traceDirSetting = AppSettings::traceDirOverride();
-    const std::string traceDir =
-        (traceDirSetting.isEmpty() ? AppPaths::instanceDir() : traceDirSetting).toStdString();
-    const auto logSink = [](const std::string& line) {
-        qDebug().noquote() << "[preset]" << QString::fromStdString(line);
+    env.traceDir = (traceDirSetting.isEmpty() ? AppPaths::instanceDir() : traceDirSetting).toStdString();
+    env.log = [](const std::string& line) { qDebug().noquote() << "[preset]" << QString::fromStdString(line); };
+    env.onSaveAs = [this](const PresetSaveAsRequest& request, std::string* saveError) {
+        return ::saveAsFromPreset(m_moduleManager, m_floppyManager, request, saveError);
     };
 
-    const PresetSaveAsFn onSaveAs = [this](PresetStep::SaveAsTarget target, const std::string& name,
-                                           std::string* saveError) {
-        return ::saveAsFromPreset(m_moduleManager, m_floppyManager, target, name, saveError);
-    };
-
-    if (preset.isPC1600()) {
-        PC1600Machine& machine = m_controller->resetBareForPresetPC1600(
-            preset.romVariant == "old" ? PC1600RomVersion::Old : PC1600RomVersion::New,
-            preset.ce1600pRomVariant == "old" ? CE1600PRomVersion::Old : CE1600PRomVersion::New);
-        const ScopedYieldHook<PC1600Machine> yieldHook(machine, m_yieldHook, m_controller->clockHz());
-        // Announce the model switch before applyPC1600Preset() even runs,
-        // not after -- MainWindow's `armed()` handler (below) needs
-        // MachineController::currentModel() to already read PC-1600 so it
-        // paints the right faceplate/control-bar while the machine is still
-        // powered off.
-        m_controller->finishPresetLoad(Model::PC1600);
-        bool armedFired = false;
-        const auto onArmed = [this, &armedFired](const PresetLoadResult& armedSoFar) {
-            armedFired = true;
-            m_moduleManager->syncFromPresetLoad(1, QString::fromStdString(armedSoFar.slot1ResolvedPath));
-            m_moduleManager->syncFromPresetLoad(2, QString::fromStdString(armedSoFar.slot2ResolvedPath));
-            m_floppyManager->syncFromPresetLoad(QString::fromStdString(armedSoFar.floppyImageLabel),
-                                                QString::fromStdString(armedSoFar.floppyResolvedPath));
-            emit armed();
-        };
-        const PresetLoadResult result =
-            applyPC1600Preset(machine, preset, logSink, traceDir, moduleDir,
-                               [&machine] { seedClockFromHostTime(machine); }, romDirs, extraModuleDirs,
-                               onArmed, onSaveAs);
-        // Safety net for a preset that fails before ever arming (bad
-        // modulespec, missing plotter ROM, ...) -- onArmed never fired, so
-        // the machine's actually-empty slots (resetBareForPresetPC1600()
-        // already swapped in a bare machine) still need reflecting into the
-        // module manager instead of leaving it showing the previous load's
-        // labels. Skipped once armed: onArmed already synced, and a later
-        // `saveas:` step has since retargeted the slot/floppy at its saved
-        // copy -- re-syncing from `result` would revert that to the
-        // originally loaded module/disk.
-        if (!armedFired) {
-            m_moduleManager->syncFromPresetLoad(1, QString::fromStdString(result.slot1ResolvedPath));
-            m_moduleManager->syncFromPresetLoad(2, QString::fromStdString(result.slot2ResolvedPath));
-            m_floppyManager->syncFromPresetLoad(QString::fromStdString(result.floppyImageLabel),
-                                                QString::fromStdString(result.floppyResolvedPath));
-        }
-        if (!result.ok) {
-            *error = QString::fromStdString(result.error);
-            return false;
-        }
-        return true;
-    }
-
-    PC1500Machine& machine = m_controller->resetBareForPresetPC1500(preset.variant);
-    const ScopedYieldHook<PC1500Machine> yieldHook(machine, m_yieldHook, m_controller->clockHz());
-    const Model model = modelForPreset(preset);
-    // Announce the model switch before applyPC1500Preset() even runs, not
-    // after -- see the matching comment in the PC-1600 branch above.
-    m_controller->finishPresetLoad(model);
-    bool armedFired = false;
-    const auto onArmed = [this, &armedFired](const PresetLoadResult& armedSoFar) {
-        armedFired = true;
-        m_moduleManager->syncFromPresetLoad(1, QString::fromStdString(armedSoFar.slot1ResolvedPath));
-        m_moduleManager->syncFromPresetLoad(2);
-        emit armed();
-    };
-    const PresetLoadResult result =
-        applyPC1500Preset(machine, preset, logSink, traceDir, moduleDir,
-                           [&machine] { seedClockFromHostTime(machine); }, romDirs, extraModuleDirs, onArmed,
-                           onSaveAs);
-    // Safety net for a preset that fails before ever arming -- see the
-    // matching comment in the PC-1600 branch above.
-    if (!armedFired) {
-        m_moduleManager->syncFromPresetLoad(1, QString::fromStdString(result.slot1ResolvedPath));
-        m_moduleManager->syncFromPresetLoad(2);
-    }
+    const PresetLoadResult result = preset.isPC1600() ? runPC1600Preset(preset, env) : runPC1500Preset(preset, env);
     if (!result.ok) {
         *error = QString::fromStdString(result.error);
         return false;
@@ -292,7 +196,53 @@ bool PresetController::runPreset(const PresetFile& preset, QString* error) {
     return true;
 }
 
+// Both run methods announce the model switch before apply*Preset() even
+// runs, not after -- MainWindow's `armed()` handler needs
+// MachineController::currentModel() to already read the new model so it
+// paints the right faceplate/control bar while the machine is still off.
+// Core fires onArmed on every arming outcome (see PresetArmedFn), so the
+// pickers are synced exactly once, before any `saveas:` step retargets
+// them.
+
+PresetLoadResult PresetController::runPC1500Preset(const PresetFile& preset, const PresetEnv& env) {
+    PC1500Machine& machine = m_controller->resetBareForPresetPC1500(preset.variant);
+    const ScopedYieldHook<PC1500Machine> yieldHook(machine, m_yieldHook, m_controller->clockHz());
+    m_controller->finishPresetLoad(modelForPreset(preset));
+    const auto onArmed = [this](const PresetLoadResult& armedSoFar) {
+        m_moduleManager->syncFromPresetLoad(1, QString::fromStdString(armedSoFar.slot1ResolvedPath));
+        m_moduleManager->syncFromPresetLoad(2);
+        emit armed();
+    };
+    return applyPC1500Preset(machine, preset, env.log, env.traceDir, env.moduleDir,
+                             [&machine] { seedClockFromHostTime(machine); }, env.romDirs, env.extraModuleDirs,
+                             onArmed, env.onSaveAs);
+}
+
+PresetLoadResult PresetController::runPC1600Preset(const PresetFile& preset, const PresetEnv& env) {
+    PC1600Machine& machine = m_controller->resetBareForPresetPC1600(
+        preset.romVariant == "old" ? PC1600RomVersion::Old : PC1600RomVersion::New,
+        preset.ce1600pRomVariant == "old" ? CE1600PRomVersion::Old : CE1600PRomVersion::New);
+    const ScopedYieldHook<PC1600Machine> yieldHook(machine, m_yieldHook, m_controller->clockHz());
+    m_controller->finishPresetLoad(Model::PC1600);
+    const auto onArmed = [this](const PresetLoadResult& armedSoFar) {
+        m_moduleManager->syncFromPresetLoad(1, QString::fromStdString(armedSoFar.slot1ResolvedPath));
+        m_moduleManager->syncFromPresetLoad(2, QString::fromStdString(armedSoFar.slot2ResolvedPath));
+        m_floppyManager->syncFromPresetLoad(QString::fromStdString(armedSoFar.floppyImageLabel),
+                                            QString::fromStdString(armedSoFar.floppyResolvedPath));
+        emit armed();
+    };
+    return applyPC1600Preset(machine, preset, env.log, env.traceDir, env.moduleDir,
+                             [&machine] { seedClockFromHostTime(machine); }, env.romDirs, env.extraModuleDirs,
+                             onArmed, env.onSaveAs);
+}
+
 bool PresetController::loadBasicProgramLive(const QString& path, QString* error) {
+    // Live-machine LOAD, like LOAD on the real machine: no reset, MODE
+    // change or NEW0 -- the user has prepared the machine (memory cards,
+    // `NEW`, MODE, TITLE) as they would before typing LOAD. A listing or a
+    // tokenized file; on the PC-1600 the MODE picks the keyword table and
+    // the TITLE area is the target.
+    BasicLoadResult loaded;
     if (m_controller->currentModel() == Model::PC1600) {
         PC1600Machine* machine = m_controller->pc1600();
         if (!machine) {
@@ -300,33 +250,16 @@ bool PresetController::loadBasicProgramLive(const QString& path, QString* error)
             return false;
         }
         const ScopedYieldHook<PC1600Machine> yieldHook(*machine, m_yieldHook, m_controller->clockHz());
-        return loadBasicProgramLiveOn(*machine, basic::TransferModel::PC1600, path.toStdString(), error);
+        loaded = loadBasicProgramFile(*machine, path.toStdString());
+    } else {
+        PC1500Machine* machine = m_controller->pc1500();
+        if (!machine) {
+            *error = tr("No PC-1500 machine is running.");
+            return false;
+        }
+        const ScopedYieldHook<PC1500Machine> yieldHook(*machine, m_yieldHook, m_controller->clockHz());
+        loaded = loadBasicProgramFile(*machine, path.toStdString());
     }
-    PC1500Machine* machine = m_controller->pc1500();
-    if (!machine) {
-        *error = tr("No PC-1500 machine is running.");
-        return false;
-    }
-    const ScopedYieldHook<PC1500Machine> yieldHook(*machine, m_yieldHook, m_controller->clockHz());
-    return loadBasicProgramLiveOn(*machine, basic::TransferModel::PC1500, path.toStdString(), error);
+    if (!loaded.ok) *error = QString::fromStdString(loaded.error);
+    return loaded.ok;
 }
-
-#else  // !CALCU1600_PRESET_LOADER_AVAILABLE
-
-bool PresetController::loadPreset(const QString&, QString* error) {
-    *error = tr("Preset loading isn't available in this build yet (it currently requires the macOS build -- "
-                "see Qt6/CMakeLists.txt).");
-    return false;
-}
-
-bool PresetController::loadDefaultPreset(const QString& path, Model, QString* error) {
-    return loadPreset(path, error);
-}
-
-bool PresetController::loadBasicProgramLive(const QString&, QString* error) {
-    *error = tr("Loading a BASIC program isn't available in this build yet (it currently requires the macOS "
-                "build -- see Qt6/CMakeLists.txt).");
-    return false;
-}
-
-#endif

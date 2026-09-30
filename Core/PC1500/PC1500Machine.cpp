@@ -1,10 +1,7 @@
 #include "PC1500Machine.hpp"
 
 PC1500Machine::PC1500Machine(PC1500Variant variant)
-    : m_memory(variant), m_cpu(m_memory), m_expansionConnector(variant), m_systemBus(variant) {
-    m_memory.setExpansionConnector(&m_expansionConnector);
-    m_memory.setSystemBus(&m_systemBus);
-}
+    : m_memory(variant), m_cpu(m_memory) {}
 
 bool PC1500Machine::loadROM(const uint8_t* data, std::size_t size) {
     return m_memory.loadROM(data, size);
@@ -25,12 +22,13 @@ void PC1500Machine::reset() {
     m_keyQueueCurrentKey.clear();
     m_keyQueuePhaseCyclesRemaining = 0;
     m_cpu.reset();
+    m_debugStop.clear();
     // A chip reset re-anchors an attached CE-150 (LH5810 latches cleared,
     // steppers/pen re-homed) but does NOT unplug it or wipe its paper --
     // real ink stays on real paper. Mirrors the CE-1600P, whose card is
     // likewise left attached across PC1600Machine::reset().
     if (m_ce150Card) m_ce150Card->reset();
-    if (m_ce158Card) m_ce158Card->reset();
+    m_ce158.reset();
 }
 
 void PC1500Machine::allReset() {
@@ -48,7 +46,7 @@ bool PC1500Machine::attachCE150(const uint8_t* rom, size_t romSize) {
     std::lock_guard<std::mutex> lock(m_mutex);
     detachCE150Locked();
     card->reset();
-    m_systemBus.attach(card.get());
+    m_memory.systemBus().attach(card.get());
     m_ce150Card = std::move(card);
     return true;
 }
@@ -60,21 +58,24 @@ void PC1500Machine::detachCE150() {
 
 void PC1500Machine::detachCE150Locked() {
     if (!m_ce150Card) return;
-    m_systemBus.detach(m_ce150Card.get());
+    m_memory.systemBus().detach(m_ce150Card.get());
     m_ce150Card.reset();
 }
 
 bool PC1500Machine::attachCE158(const uint8_t* rom, size_t romSize) {
-    if (romSize != Ce158Card::kRomSize) return false;
-    auto card = std::make_unique<Ce158Card>();
-    if (!card->loadRom(rom, romSize)) return false;
     std::lock_guard<std::mutex> lock(m_mutex);
+    auto card = m_ce158.build(rom, romSize, Ce158Card::kCpuHz);
+    if (!card) return false;
     detachCE158Locked();
-    card->reset();
-    card->setSerialLink(m_ce158Link);
-    m_systemBus.attach(card.get());
-    m_ce158Card = std::move(card);
+    m_memory.systemBus().attach(card.get());
+    m_ce158.install(std::move(card));
     return true;
+}
+
+void PC1500Machine::attachBusRom(std::unique_ptr<BusRomCard> card) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_memory.systemBus().attachFirst(card.get());
+    m_busRoms.push_back(std::move(card));
 }
 
 void PC1500Machine::detachCE158() {
@@ -83,21 +84,19 @@ void PC1500Machine::detachCE158() {
 }
 
 void PC1500Machine::detachCE158Locked() {
-    if (!m_ce158Card) return;
-    m_systemBus.detach(m_ce158Card.get());
-    m_ce158Card.reset();
+    if (!m_ce158.attached()) return;
+    m_memory.systemBus().detach(m_ce158.card());
+    m_ce158.remove();
 }
 
 void PC1500Machine::setCE158SerialLink(SerialLink* link) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    m_ce158Link = link;
-    if (m_ce158Card) m_ce158Card->setSerialLink(link);
+    m_ce158.setSerialLink(link);
 }
 
 std::vector<uint8_t> PC1500Machine::drainCE158ParallelOutput() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_ce158Card) return {};
-    return m_ce158Card->drainParallelOutput();
+    return m_ce158.drainParallelOutput();
 }
 
 // The four below take m_mutex so the GUI thread can read/clear the plotter
@@ -143,6 +142,8 @@ void PC1500Machine::seedClock(int year, int month, int day, int hour, int minute
 int PC1500Machine::step() {
     std::lock_guard<std::mutex> lock(m_mutex);
     int c = m_cpu.step();
+    if (c == 0 && m_cpu.breakpointsEnabled() && m_cpu.consumeBreakpointHit()) m_debugStop.latch(DebugStop::Breakpoint, 1);
+    if (m_watches && m_watches->hitPending()) m_debugStop.latch(DebugStop::Watch, 1);
     // PU/PV (SPU/RPU/SPV/RPV) never touch the bus themselves, so pushing
     // their post-instruction state here is sufficient for the next bus
     // access to see it -- see PC1500Memory::updatePUPV()'s own doc comment.
@@ -168,7 +169,7 @@ void PC1500Machine::advancePeripherals(uint32_t cycles) {
     // Per-step hook for an attached CE-150 (no-op today -- the plotter is
     // fully reactive; see Ce150Card::tick()).
     if (m_ce150Card) m_ce150Card->tick(cycles);
-    if (m_ce158Card) m_ce158Card->tick(cycles); // the UART's own clock keeps running
+    m_ce158.tick(cycles); // the UART's own clock keeps running
 }
 
 void PC1500Machine::setYieldHook(std::function<void()> hook, uint64_t intervalCycles) {
@@ -201,7 +202,10 @@ uint64_t PC1500Machine::runCycles(uint64_t maxCycles) {
         int c = m_cpu.step();
         m_memory.updatePUPV(m_cpu.pu(), m_cpu.pv());
         if (c == 0) {
-            if (m_cpu.consumeBreakpointHit()) break;
+            if (m_cpu.breakpointsEnabled() && m_cpu.consumeBreakpointHit()) {
+                m_debugStop.latch(DebugStop::Breakpoint, 1);
+                break;
+            }
             if (m_cpu.halted() || m_cpu.poweredOff()) {
                 // step() still ticks the timer once per call while halted
                 // (see LH5801::step()'s HLT branch) -- keep polling so a
@@ -226,6 +230,10 @@ uint64_t PC1500Machine::runCycles(uint64_t maxCycles) {
         advancePeripherals(static_cast<uint32_t>(c));
         consumed += static_cast<uint64_t>(c);
         maybeDrainTrace();
+        if (m_watches && m_watches->hitPending()) { // the watched access's instruction has completed
+            m_debugStop.latch(DebugStop::Watch, 1);
+            break;
+        }
     }
     return consumed;
 }

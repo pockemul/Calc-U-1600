@@ -1,7 +1,7 @@
 # examples/setup
 
-See also `docs/User-Guide.md`'s "Preloaded-data cards & Dump Card YAML"
-section for a narrative walkthrough of the workflow below.
+See also `docs/User-Guide.md`'s "Custom memory cards" section (9.3) for
+the workflow below.
 
 These files are not demos to look at — they are **preparation scripts**. Each one
 drives the emulator through the steps needed to get a memory card (or expansion
@@ -14,22 +14,22 @@ of BASIC programs, write a config file, and so on.
    module fitted and types/loads everything into the card.
 2. Once the card is set up, do one of two things with it:
 
-   - **Save the card.** Write the card image out under its final name (e.g.
-     `CE-1601M - Progs`) and reference that name from a "real" preset such as
-     `examples/DiskWorks.pc1600`. The preset then mounts a card that already has
-     the programs and `DW.CFG` on it.
+   - **Save the card.** End the preset with `- saveas: template|live ...`: by
+     name into your save folder, or as a file next to the preset
+     (`file:`), which a "real" preset then loads with `slot-N-file:` /
+     `floppy-file:`. `examples/dwx/make_diskworks_media.pc1600` does this for
+     `examples/dwx/DiskWorks.pc1600`.
 
    - **Dump the card.** Use the debug **"Dump Card YAML"** action to emit a card
-     definition, and fold the pre-defined data it captures into one of the
-     `*.card.yaml` files in `Calc-U-1600/Resources/` (e.g. `ce1601m.card.yaml`).
-     That bakes the prepared contents into the shipped resource so a fresh card
-     comes up already populated.
+     definition, and paste the data it captures into a card definition's
+     `initial-content:` (your own copy of a bundled one from
+     `Qt6/resources/cards/`, e.g. `ce1601m.card.yaml`). A fresh card from
+     that definition then comes up already populated.
 
 ## Contents
 
 | File | Prepares |
 | --- | --- |
-| `make_diskworks_card.pc1600` | CE-1601M as a RAM disk with the DiskWorks BASIC programs + `DW.CFG` on `S2:` |
 | `ce1638_bankswrm.pc1500` / `.pc1500a` | PC-1500 with a real CE-1638 128K module, bank-switch test loaded |
 | `firmware_bootstrap_util*.pc1500a` | Firmware bootstrap / update utilities staged into a module |
 | `update.bas`, `updaterm.bas`, `util_*.bas`, `utilrm_*.bas` | BASIC sources loaded by the bootstrap presets |

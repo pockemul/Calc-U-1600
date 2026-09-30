@@ -5,7 +5,7 @@
 // ── PC-1600 LCD status-symbol line ───────────────────────────────────────
 //
 // The 16-symbol strip above the 156x32 graphics area (TRM §7.3;
-// SharpPC1500Reference/PC-1600/PC-1600-Display-HD61202.md §1). These are
+// Sharp1500-1600-Ref/PC-1600/PC-1600-Display-HD61202.md §1). These are
 // printed fixed-legend text permanently etched on the LCD glass, each
 // with its own small individually-drivable segment -- the same style as a
 // scientific calculator's fixed DEG/RAD/GRAD strip. This class is
@@ -29,22 +29,21 @@
 // (`OR 08H`) if either was set, so the byte reaching the glass can never
 // carry bit 7 with this ROM.
 //
-// **`Kbii` is nevertheless a real, independently-driven segment**: a
-// second printed position next to "S" carries the "ローマ字→カナ"
-// (romaji→kana) caption. With the contrast cranked up far enough to
-// reveal unlit segments, "カナ" is visible alongside "S" even on a
-// **western** unit -- i.e. same glass, same segment wiring on both
-// models, and which of the two lights is a ROM decision. A Japanese
-// machine's firmware is assumed to drive bit 7 for kana-entry mode where
-// this one folds into S.
+// **The "ローマ字→カナ" (romaji→kana) caption is two segments of its
+// own, not KBII.** The Service Manual's key circuit diagram (printed
+// pp. 43-44) lists the glass pin under each legend. Every symbol above sits
+// on the common its bit predicts (common Xn = RAM line n-1), and the caption
+// after S is on **X35 = page 4 bit 2** and **X59 = page 7 bit 2**, both "--"
+// in the TRM table. KBII's own bit (page 4 bit 7 = X40) has no electrode,
+// which fits the ROM folding it into S. `Romaji` and `Kana` follow the pin
+// order after S. Which part of the caption each one lights is inferred, not
+// printed. The western ROM never sets either bit (probe 2026-09-26), so both
+// stay dark unless a program writes them. SMBLSET B=02H keeps bit 2
+// (`AND 77H`).
 //
-// So `Kbii` is read straight off panel bit 7 like every other position
-// (`PC1600Display::refreshStatusSymbols()`), and simply stays false for
-// the life of a western session. It must NOT be wired to the KBII *mode*
-// flag (RAM F3C6H bit 7, SMBLSET's own pre-fold shadow, which is what the
-// key-code translator reads to select the alternate charset): that is
-// machine state rather than a panel segment, and driving the caption from
-// it would light the kana legend on every KBII press.
+// The KBII *mode* flag (RAM F3C6H bit 7, SMBLSET's pre-fold shadow, read
+// by the key-code translator) is machine state, not a segment, and is not
+// surfaced here.
 //
 // **DEGRAD and RUNPRO — how they pack into that grid**, consistent with
 // the TRM's own three-separate-bits DE/RAD/G row above:
@@ -53,21 +52,23 @@
 //     segments (though the TRM models them as three independent bits;
 //     real firmware is assumed to only ever set one at a time, same as
 //     any other angle-mode indicator). One shared start position; the
-//     GUI picks the matching text (see `PC1600LCDDisplayView.swift`).
+//     GUI picks the matching text.
 //   - **RUNPRO is two independently-driven legends** that simply sit
 //     close enough together to visually read as one word.
 //
 // **Wiring**: these three 8-bit sets are read from the *centre* HD61102
 // controller's own column 63, pages 4/6/7 respectively, rotated by the
 // same `addressStartLine` the display-scroll logic uses --
-// page4=B=02H, page6=B=01H, page7=B=00H. A headless trace independently
-// found non-zero data at exactly IC3 (the centre chip)'s column 63,
-// pages 6/7 during boot, consistent with this being the real mechanism.
+// page4=B=02H, page6=B=01H, page7=B=00H. The ROM's symbol writer confirms
+// the storage (PC1600-P2-B6-new.bin 8220H, called with the page in A): it
+// sets page (A + DSPLPTR F05CH) & 7 and column 3FH on IC3 (C = 54H, via
+// 81F0H/81FCH), then writes the byte with OUT (56H). Its RAM shadows
+// (read by 8208H) are F64EH/F64FH/F3C6H for pages 7/6/4; page 5 is unused.
 // See `PC1600Display::refreshStatusSymbols()`.
 class PC1600StatusLine {
 public:
     enum class Symbol {
-        Busy, Shift, S, Kbii, Small, Deg, Rad, Grad, Run, Pro, Reserve, Def,
+        Busy, Shift, S, Romaji, Kana, Small, Deg, Rad, Grad, Run, Pro, Reserve, Def,
         I, II, III, Ctrl, Batt,
         Count
     };

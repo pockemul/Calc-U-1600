@@ -9,11 +9,16 @@
 #include <utility>
 #include <vector>
 
+#include "../Connector/BusRomCard.hpp"
 #include "../Connector/CE1600FCard.hpp"
 #include "../Connector/CE1600PCard.hpp"
+#include "../Connector/PC1600HostDriveCard.hpp"
+#include "../Connector/Ce150Card.hpp"
+#include "../Connector/Ce158Port.hpp"
 #include "../Connector/ExpansionCard.hpp"
 #include "../CPU/LH5803/LH5803.hpp"
 #include "../CPU/LH5803/LH5803SharedMemory.hpp"
+#include "../CPU/DebugStop.hpp"
 #include "../CPU/SC7852/SC7852.hpp"
 #include "../PC1500/PC1500TraceFile.hpp"
 #include "PC1600Bank.hpp"
@@ -107,14 +112,29 @@ public:
 
     /// Runs until `maxCycles` **T-states** (see kTStateHz) have been
     /// consumed across both CPUs combined, returning the number actually
-    /// consumed. A plain step-and-sum loop: unlike PC1500Machine's, no
-    /// breakpoint or stuck-HALT bailout is needed here, because the bus
-    /// arbiter always has the other CPU to dispatch to on the next call, so
-    /// this loop cannot spin without making progress. A halted SC7852 step
-    /// is charged SC7852::kHaltTickCycles, the same figure step() charges
-    /// its own timer accumulators -- one function now owns both, so they
-    /// can no longer drift apart.
+    /// consumed. A step-and-sum loop that returns early on a debugger stop
+    /// (see consumeDebugStop()). Each step counts the T-states step()
+    /// charged the shared clocks, so the budget and the clocks can't drift
+    /// apart.
     uint64_t runCycles(uint64_t maxCycles);
+
+    // ── Debugger stops ────────────────────────────────────────────────────
+    // step() and runCycles() latch a stop when either CPU parks on a PC
+    // breakpoint (step() returns 0 then, without advancing any clock) or
+    // completes an instruction that hit a memory watch; runCycles() then
+    // returns early. CPU 1 = the Z-80, 2 = the LH5803. Cleared by a reset.
+    DebugStop consumeDebugStop() { return m_debugStop.consume(); }
+    /// Memory watches of one CPU (each checks its own data accesses in its
+    /// own address space); nullptr turns its checking off. Not owned.
+    void setWatches(int cpu, WatchSet* watches) {
+        if (cpu == 1) {
+            m_z80Watches = watches;
+            m_sc7852.setWatches(watches);
+        } else {
+            m_lh5803Watches = watches;
+            m_lh5803.setWatches(watches);
+        }
+    }
 
     /// Optional host callback invoked from inside runCycles() roughly every
     /// `intervalTStates` T-states of emulated time (counted across calls, so many
@@ -141,7 +161,7 @@ public:
     // `PC1600-P1-B4-CE1600P-{new,old}.bin`/`PC1600-P1-B5-CE1600P-OR-F-{new,old}.bin` are confirmed CE-1600P ROM (see
     // roms/README.md) -- `attachCE1600P` builds a card, loads both halves,
     // and attaches it to `m_z80Mem.ce1600pBus()`; PC1600Memory routes Page B
-    // banks 4/5 and I/O ports 0x70-0x8F to that bus once attached.
+    // banks 4-7 and I/O ports 0x70-0x9F to that bus once attached.
     //
     // The CE-1600F floppy docks onto the CE-1600P and cannot run
     // standalone (its driver lives in the CE-1600P's own bank-5 ROM), so
@@ -192,12 +212,36 @@ public:
     /// motorOn(). False when no floppy is attached.
     bool ce1600fMotorOn() const;
 
+    // ── Host-directory drive S3: / Y: (60-pin system bus, page-1 bank 7) ─
+    //
+    // Calc-U-1600's own peripheral (PC1600HostDriveCard): a host directory
+    // as a PC-1600 file device. Independent of the CE-1600P; both share the
+    // bus. Attach/detach like any peripheral with the machine off -- the
+    // ROM's SCANMODS only finds the module at power-on/reset. Changing the
+    // directory of an attached drive is a live media swap. All GUI-safe
+    // (take m_mutex: the card runs inside step()).
+    bool attachHostDrive(const uint8_t* rom, size_t romSize, const std::filesystem::path& dir);
+    void detachHostDrive();
+
+    // ── Bus ROMs (preset `bus-rom:`, Connector/BusRomCard.hpp) ───────────
+    //
+    // A plain ROM on the system bus (a page B bank) or on the LH5803 side,
+    // in front of every other card there, so a rebuilt ROM shadows a
+    // bundled one (e.g. the host drive's bank 7). Kept for the machine's
+    // lifetime; a preset builds a fresh machine.
+    void attachBusRom(std::unique_ptr<PC1600BusRomCard> card);
+    void attachBusRom(std::unique_ptr<BusRomCard> card);
+    bool hostDriveAttached() const;
+    void setHostDriveDirectory(const std::filesystem::path& dir);
+    std::filesystem::path hostDriveDirectory() const;
+
     // ── CE-150 plotter (LH5803 side, MODE 1) ────────────────────────────
     //
     // The PC-1500's CE-150 attached to the PC-1600's LH5803 compatibility
     // CPU: its ROM window (LH5803 0xA000-0xBFFF, PV=0) and LH5810 block
     // (LH5803 ME1 0xB008-0xB00F) are served by the same Ce150Card the
-    // PC-1500 uses, wired through LH5803SharedMemory. Mutually exclusive
+    // PC-1500 uses, plugged into PC1600Memory::lh5803PeripheralBus() (the
+    // LH5803 side of the 60-pin connector). Mutually exclusive
     // with the CE-1600P on the shared 60-pin bus concept -- attaching one
     // detaches the other. A chip/machine reset re-anchors the card but
     // leaves it attached (like the CE-1600P).
@@ -222,8 +266,8 @@ public:
     // setCE158SerialLink() is kept across detach/attach.
     bool attachCE158(const uint8_t* rom, size_t romSize); // 16384 bytes
     void detachCE158();
-    bool ce158Attached() const { return m_ce158Card != nullptr; }
-    Ce158Card* ce158Card() { return m_ce158Card.get(); } // unlocked -- tests only
+    bool ce158Attached() const { return m_ce158.attached(); }
+    Ce158Card* ce158Card() { return m_ce158.card(); }    // unlocked -- tests only
     void setCE158SerialLink(SerialLink* link);             // non-owning; GUI-safe
     std::vector<uint8_t> drainCE158ParallelOutput();       // GUI-safe
 
@@ -267,7 +311,16 @@ public:
     /// releaseKey convention.
     void pressKey(const std::string& name);
     void releaseKey(const std::string& name);
+    /// The ON/BREAK key. While the machine runs it is BREAK (the ROM polls
+    /// its latch); while the system is off its rising edge powers it on.
     void setOnKeyPressed(bool pressed);
+    /// True while the sub-CPU has the system switched off (after the ROM's
+    /// OFF / auto power-off sequence). Only the always-on parts advance:
+    /// the sub-CPU's clock and timers, the LCD and RAM contents stay.
+    bool isPoweredOff() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return !m_z80Mem.subCpu().systemOn();
+    }
     /// A point-in-time copy of the display's pixel state -- safe to read on
     /// a different thread while the emulation loop is mid-step() (see
     /// PC1600DisplaySnapshot's own doc comment).
@@ -317,6 +370,12 @@ public:
     /// One byte, read through the currently-selected banks (Port 31H/28H/3DH
     /// state as-is) -- same semantics as PC1500Machine::debugPeek().
     uint8_t debugPeek(uint16_t addr);
+
+    /// MODE 1 (PC-1500 compatible) is on: BMODE (F1BCH) bit 6. The loaders
+    /// read it to decide the keyword table and the address space.
+    bool mode1();
+    /// The selected program area, TITLE (F1D5H): 0 = S0, 1 = S1, 2 = S2.
+    int programAreaTitle();
 
     /// True while SC7852 owns the bus -- false means the OFF-key/auto-
     /// power-off handoff has parked the machine on the LH5803 side (see
@@ -409,6 +468,9 @@ public:
     void endCpuTrace();
 
     bool cpuTraceActive() const { return m_traceFile != nullptr; }
+    /// Size of the active capture so far (0 when none); see
+    /// PC1500TraceFile::bytesWritten().
+    uint64_t cpuTraceBytes() const { return m_traceFile ? m_traceFile->bytesWritten() : 0; }
 
 private:
     mutable std::mutex m_mutex; // guards step()/reset()/pressKey/releaseKey/setOnKeyPressed/displaySnapshot
@@ -422,6 +484,7 @@ private:
     /// attach/detach calls take it because step() dereferences these
     /// cards (and the buses dispatch to them) on the emulation thread.
     void detachCE1600PLocked();
+    void detachHostDriveLocked();
     void detachCE150Locked();
     void detachCE158Locked();
 
@@ -431,15 +494,20 @@ private:
     PC1600Bank m_bank;
     PC1600Memory m_z80Mem;
     SC7852 m_sc7852;
+    DebugStopLatch m_debugStop;
+    WatchSet* m_z80Watches{nullptr};
+    WatchSet* m_lh5803Watches{nullptr};
     LH5803SharedMemory m_lh5803Mem;
     LH5803 m_lh5803;
     PC1600BusArbiter m_arbiter;
 
     std::unique_ptr<CE1600PCard> m_ce1600pCard; // see attachCE1600P()
     std::unique_ptr<CE1600FCard> m_ce1600fCard; // union-attached with m_ce1600pCard
+    std::unique_ptr<PC1600HostDriveCard> m_hostDriveCard; // see attachHostDrive()
+    std::vector<std::unique_ptr<PC1600BusRomCard>> m_systemBusRoms; // see attachBusRom()
+    std::vector<std::unique_ptr<BusRomCard>> m_lh5803BusRoms;
     std::unique_ptr<Ce150Card> m_ce150Card;     // see attachCE150() -- LH5803-side plotter (MODE 1)
-    std::unique_ptr<Ce158Card> m_ce158Card;     // see attachCE158() -- LH5803-side interface (MODE 1)
-    SerialLink* m_ce158Link = nullptr;          // see setCE158SerialLink()
+    Ce158Port m_ce158;                          // see attachCE158() -- LH5803-side interface (MODE 1)
 
 
     // ── Headless CPU-trace file -- see beginCpuTrace() ───────────────────
@@ -493,18 +561,20 @@ private:
     static_assert(kTStateHz * kTimer64AccumScale % 128 == 0, "64 Hz half period must be exact");
     int m_timer64Accum{0};
     bool m_timer64State{false};
-    bool m_onWakePending{false}; // ON pressed, not yet delivered -- see setOnKeyPressed()
+    // System power (SubCpu doc §4) is the sub-CPU's systemOn(). While it
+    // has VCC off, step() advances only the always-on clocks,
+    // kOffSliceTStates at a time, until a power-on source fires; power-on
+    // is a reset with a cause.
+    static constexpr int kOffSliceTStates = 256;
+    void powerOnLocked();
+    /// step() with m_mutex held; `tstates` receives what the step charged
+    /// the shared clocks (0 when parked on a breakpoint).
+    int stepLocked(uint64_t* tstates);
 
-    // Sub-CPU interrupt (port 32H bit 6, INT6 pin 84). Per
-    // PC-1600-CPU-SC7852-Z80.md §5.2 this one line aggregates everything
-    // the LU-57813P raises: the 0.5s timer, low-battery/analog-in/CI
-    // checks, auto-power-off, the RS-232C timeout, and the wakeup/alarm1/
-    // alarm2 timers. Only the 0.5s timer is modeled here -- it is the one
-    // that free-runs with no external stimulus, and §5.2's own firmware
-    // list (TRM §3.4.1(2)(e)) makes it the carrier for the periodic
-    // housekeeping tasks. The event-driven members of that list stay
-    // unraised until there is something to raise them: no battery or
-    // analog model, no CI line, and no serial peripheral to time out.
+    // The sub-CPU's 0.5 s tick. Its interrupt line (Z7 -> INT6, port 32H
+    // bit 6) and the other events that drive it -- the 1 s tick and the
+    // wake-up / alarm timers, compared at each minute carry -- live in
+    // PC1600SubCpu (Sharp1500-1600-Ref PC-1600-SubCpu-LU57813P.md §5).
     //
     // Both signals come out of the sub-CPU's one divider chain, so 0.5 s is
     // exactly 64 edges (32 periods) of the 64 Hz signal, at a fixed phase

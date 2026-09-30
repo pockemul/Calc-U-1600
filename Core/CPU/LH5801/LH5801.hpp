@@ -3,6 +3,9 @@
 #include <cstdint>
 
 #include "../../TraceTypes.hpp"
+#include "../HistoryRing.hpp"
+#include "../WatchSet.hpp"
+#include "../BreakpointSet.hpp"
 #include "../TraceRing.hpp"
 
 // ── Bus interface ────────────────────────────────────────────────────────
@@ -170,6 +173,27 @@ public:
     /// (and thus the next unfrozen drainTraceEvents() call) is untouched.
     uint32_t peekTraceEvents(CpuFrame* out, uint32_t max) { return m_trace.peek(out, max); }
 
+    /// The debugger's always-on history of the last retired instructions
+    /// (see HistoryRing.hpp). Recorded on every step() regardless of the
+    /// TRACE_* flags; cleared by reset().
+    using History = HistoryRing<LH5801HistoryFrame, 32>;
+    const History& history() const { return m_history; }
+
+    /// Data breakpoints: every data access (not opcode/operand fetches) is
+    /// checked against `watches` while it is non-null. Not owned.
+    void setWatches(WatchSet* watches) { m_watches = watches; }
+
+    /// Continue from a breakpoint: the instruction at the current PC
+    /// executes once even though it is a breakpoint. The skip is tied to
+    /// that address, so an interrupt taken first can't spend it on its
+    /// handler; it lasts until that instruction runs or the next call.
+    void resumePastBreakpoint() { m_skipBreakpointAt = P; }
+    void clearBreakpointSkip() { m_skipBreakpointAt = -1; }
+
+    /// PC breakpoints, checked at the start of each instruction while
+    /// enabled. A hit makes step() return 0 without executing anything.
+    void setBreakpointsEnabled(bool on) { m_breakpointsEnabled = on; }
+    bool breakpointsEnabled() const { return m_breakpointsEnabled; }
     void addBreakpoint(uint16_t addr) { m_breakpoints.add(addr); }
     void removeBreakpoint(uint16_t addr) { m_breakpoints.remove(addr); }
     void clearBreakpoints() { m_breakpoints.clear(); }
@@ -220,6 +244,12 @@ private:
     void     setLowOf(int pair, uint8_t v);
     void     setHighOf(int pair, uint8_t v);
 
+    // ── Data access (checked against m_watches) ──────────────────────────
+    uint8_t dataME0(uint16_t a) { uint8_t v = bus.readME0(a); if (m_watches) m_watches->check(a, v, false, 0); return v; }
+    uint8_t dataME1(uint16_t a) { uint8_t v = bus.readME1(a); if (m_watches) m_watches->check(a, v, false, 1); return v; }
+    void storeME0(uint16_t a, uint8_t v) { if (m_watches) m_watches->check(a, v, true, 0); bus.writeME0(a, v); }
+    void storeME1(uint16_t a, uint8_t v) { if (m_watches) m_watches->check(a, v, true, 1); bus.writeME1(a, v); }
+
     // ── Fetch helpers ────────────────────────────────────────────────────
     uint8_t  fetch8();
     uint16_t fetch16(); // big-endian: high byte first, then low
@@ -262,11 +292,22 @@ private:
     uint32_t m_traceSeqno{0};
     TraceRing<CpuFrame, 512> m_trace;
     BreakpointSet m_breakpoints;
+    History m_history;
+    WatchSet* m_watches{nullptr};
+    bool m_breakpointsEnabled{false};
+    int32_t m_skipBreakpointAt{-1}; // resumePastBreakpoint(); -1 = none
+    uint8_t m_fetchLen{0}; // bytes fetched by the current step(), mirrored into m_history.next()
 
     bool     m_illegalOpcodeHit{false};
     uint16_t m_lastIllegalOpcodePC{0};
     uint16_t m_lastIllegalOpcode{0};
     uint8_t  m_cpuIdTag{CPU_ID_UNSPECIFIED};
 
-    void recordTraceFrame(uint32_t tf, uint16_t pcAtStart, uint16_t opcodeWord, uint8_t cycles);
+    /// Records a TRACE frame if `tf` asks for one. The flag test is inline
+    /// so the untraced hot path pays no call.
+    void recordTraceFrame(uint32_t tf, uint16_t pcAtStart, uint16_t opcodeWord, uint8_t cycles) {
+        if (tf & (TRACE_PC | TRACE_REGS_LIGHT | TRACE_REGS_FULL)) pushTraceFrame(tf, pcAtStart, opcodeWord, cycles);
+    }
+    void pushTraceFrame(uint32_t tf, uint16_t pcAtStart, uint16_t opcodeWord, uint8_t cycles);
+    void recordHistory(uint16_t pcAtStart, bool interrupt);
 };

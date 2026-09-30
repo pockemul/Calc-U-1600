@@ -4,11 +4,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "../FileIO.hpp"
 #include "../Yaml.hpp"
 
 // ── Parsed + validated memory-card definition ─────────────────────────
@@ -102,6 +104,9 @@ struct Banking {
     uint8_t triggerPort = 0;    // TriggerKind::IoPort
     bool sampleData = false;    // source-domain: data (else: address)
     std::vector<int> sampledBits;  // bit indices; sampledBits[0] is the LSB of the bank number
+    // Normalised at parse time: an unbanked region is one bank of
+    // `capacity` bytes, so readers never branch on `Region::banked` for
+    // the geometry.
     uint32_t bankCount = 0;
     uint32_t bankSize = 0;
     Addressing bankWindow;
@@ -120,9 +125,9 @@ struct Region {
     Addressing addressing;  // region gate; also the slice map when unbanked
     RegionContent content;  // used directly unless contentByBank is non-empty
     std::vector<BankContentRange> contentByBank;  // by-bank split (banked only)
-    bool banked = false;
-    Banking banking;
-    uint32_t capacity = 0;  // unbanked only (banked = bankCount * bankSize)
+    bool banked = false;    // has a bank latch (trigger + bank window)
+    Banking banking;        // bankCount/bankSize set for unbanked regions too (1 x capacity)
+    uint32_t capacity = 0;  // total bytes; banked = bankCount * bankSize
 
     // `initial-content` (spec §5a / Format.md §6), already resolved to a
     // full bank-size (or `capacity`, unbanked) byte buffer per referenced
@@ -163,8 +168,7 @@ struct MemoryCardDefinition {
     bool isRom() const {
         if (regions.empty()) return false;
         for (const Region& r : regions) {
-            const uint32_t banks = r.banked ? r.banking.bankCount : 1;
-            for (uint32_t b = 0; b < banks; ++b)
+            for (uint32_t b = 0; b < r.banking.bankCount; ++b)
                 if (r.contentForBank(b).kind != ContentKind::Rom) return false;
         }
         return true;
@@ -177,8 +181,10 @@ struct MemoryCardDefinition {
     }
 };
 
+/// `baseDir`: the definition file's own directory, which `encoding: file`
+/// paths are relative to. Empty (text not read from a file) rejects them.
 bool parseMemoryCardDefinition(const std::string& yamlText, MemoryCardDefinition* out,
-                               std::string* error);
+                               std::string* error, const std::string& baseDir = {});
 
 // ── implementation ───────────────────────────────────────────────────────
 
@@ -1059,14 +1065,14 @@ inline bool parseAddressedHex(const std::string& text, uint32_t blockLength,
 // `initial-content` (spec §5a, Format.md §6): resolves each referenced
 // bank (unbanked regions use key 0) into a full bank-size/`capacity`-length
 // byte buffer, starting from that bank's power-up-fill and overlaying each
-// block's bytes at its offset. `encoding: file` is not implemented (it
-// would need the definition file's own directory threaded through, which
-// nothing needs yet) -- unlike `rom`/`by-bank` elsewhere in this parser,
-// unsupported here means "not yet", not "never".
+// block's bytes at its offset. `encoding: file` reads a sidecar binary,
+// `path` relative to the definition's directory (`baseDir`), at parse time
+// -- so a card reloaded after a rebuild carries the new bytes (a ROM
+// module under development, docs/Debugger.md).
 inline bool parseInitialContent(const YamlNode& node, const Region& regionSoFar,
                                 std::unordered_map<uint32_t, std::vector<uint8_t>>* out,
                                 std::unordered_map<uint32_t, std::vector<bool>>* coveredOut,
-                                std::string* error) {
+                                std::string* error, const std::string& baseDir) {
     if (!node.isMap() || !node.requireOnlyKeys({"fill", "blocks"}, error)) return false;
 
     bool hasFillOverride = false;
@@ -1084,8 +1090,8 @@ inline bool parseInitialContent(const YamlNode& node, const Region& regionSoFar,
         return false;
     }
 
-    uint32_t bankCount = regionSoFar.banked ? regionSoFar.banking.bankCount : 1;
-    uint32_t bankSize = regionSoFar.banked ? regionSoFar.banking.bankSize : regionSoFar.capacity;
+    const uint32_t bankCount = regionSoFar.banking.bankCount;
+    const uint32_t bankSize = regionSoFar.banking.bankSize;
     auto& covered = *coveredOut;  // per-bank coverage, for overlap checks and the ROM rule
 
     for (const auto& entry : blocksN->seq) {
@@ -1171,8 +1177,21 @@ inline bool parseInitialContent(const YamlNode& node, const Region& regionSoFar,
                 return false;
             }
         } else if (encoding == "file") {
-            *error = "line " + std::to_string(entry.line) + ": encoding 'file' is not supported yet";
-            return false;
+            const YamlNode* pN = entry.find("path");
+            std::string rel;
+            if (!pN || !pN->asString(&rel, error)) {
+                *error = "line " + std::to_string(entry.line) + ": 'file' needs 'path'";
+                return false;
+            }
+            if (baseDir.empty() && !std::filesystem::path(rel).is_absolute()) {
+                *error = "line " + std::to_string(pN->line) + ": 'path' needs the definition's own file to be relative to";
+                return false;
+            }
+            const std::filesystem::path file = std::filesystem::path(baseDir) / rel;  // absolute rel wins
+            if (!readWholeFile(file, &bytes)) {
+                *error = "line " + std::to_string(pN->line) + ": cannot read '" + file.string() + "'";
+                return false;
+            }
         } else {
             *error = "line " + std::to_string(encN->line) + ": unknown encoding '" + encoding + "'";
             return false;
@@ -1206,7 +1225,8 @@ inline bool parseInitialContent(const YamlNode& node, const Region& regionSoFar,
     return true;
 }
 
-inline bool parseRegion(const YamlNode& node, CardHost term, Region* out, std::string* error) {
+inline bool parseRegion(const YamlNode& node, CardHost term, Region* out, std::string* error,
+                        const std::string& baseDir) {
     if (!node.isMap() ||
         !node.requireOnlyKeys({"name", "addressing", "content", "banking", "capacity",
                                "initial-content", "pc1600-module-class"},
@@ -1276,6 +1296,13 @@ inline bool parseRegion(const YamlNode& node, CardHost term, Region* out, std::s
                              error))
             return false;
     }
+    // One geometry for both kinds (see Banking::bankCount).
+    if (banked) {
+        out->capacity = out->banking.bankCount * out->banking.bankSize;
+    } else {
+        out->banking.bankCount = 1;
+        out->banking.bankSize = out->capacity;
+    }
 
     // Content is parsed after banking so `by-bank:` can validate its
     // ranges against bank-count.
@@ -1286,7 +1313,7 @@ inline bool parseRegion(const YamlNode& node, CardHost term, Region* out, std::s
     // A flash range's sector-erase must stay inside one bank (or, unbanked,
     // inside the region's capacity).
     {
-        const uint32_t span = banked ? out->banking.bankSize : out->capacity;
+        const uint32_t span = out->banking.bankSize;
         const char* spanKey = banked ? "bank-size" : "capacity";
         auto checkSectorSize = [&](const RegionContent& c) -> bool {
             if (c.kind != ContentKind::Flash) return true;
@@ -1309,15 +1336,14 @@ inline bool parseRegion(const YamlNode& node, CardHost term, Region* out, std::s
     // `content`/`contentByBank` already in place for contentForBank().
     std::unordered_map<uint32_t, std::vector<bool>> covered;
     if (initialContentN) {
-        if (!parseInitialContent(*initialContentN, *out, &out->initialContentByBank, &covered, error))
+        if (!parseInitialContent(*initialContentN, *out, &out->initialContentByBank, &covered, error, baseDir))
             return false;
     }
 
     // A ROM range has no power-up state of its own: `initial-content` blocks
     // must cover every byte of it (spec §5a). `fill:` doesn't count.
-    const uint32_t bankCount = out->banked ? out->banking.bankCount : 1;
-    const uint32_t bankSize = out->banked ? out->banking.bankSize : out->capacity;
-    for (uint32_t b = 0; b < bankCount; ++b) {
+    const uint32_t bankSize = out->banking.bankSize;
+    for (uint32_t b = 0; b < out->banking.bankCount; ++b) {
         if (out->contentForBank(b).kind != ContentKind::Rom) continue;
         auto it = covered.find(b);
         uint32_t gap = 0;
@@ -1336,7 +1362,7 @@ inline bool parseRegion(const YamlNode& node, CardHost term, Region* out, std::s
 }  // namespace mcd_detail
 
 inline bool parseMemoryCardDefinition(const std::string& yamlText, MemoryCardDefinition* out,
-                                      std::string* error) {
+                                      std::string* error, const std::string& baseDir) {
     YamlNode root;
     if (!parseYaml(yamlText, &root, error)) return false;
     if (!root.isMap()) {
@@ -1399,7 +1425,7 @@ inline bool parseMemoryCardDefinition(const std::string& yamlText, MemoryCardDef
     }
     for (const auto& rn : regionsN->seq) {
         Region region;
-        if (!mcd_detail::parseRegion(rn, out->terminology, &region, error)) return false;
+        if (!mcd_detail::parseRegion(rn, out->terminology, &region, error, baseDir)) return false;
         for (const auto& ex : out->regions) {
             if (ex.name == region.name) {
                 *error = "duplicate region name '" + region.name + "'";

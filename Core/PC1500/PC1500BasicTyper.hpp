@@ -26,8 +26,7 @@ class PC1500Machine;
 // (preset steps, BASIC program text) -- the live interactive keyboard
 // never does this: a physical or on-screen 'a' key press always sends
 // the same "a" key regardless of case, matching how a real keyboard has
-// no separate upper/lowercase keycaps (see PC1500KeyboardMap.swift's own
-// characterName(), which lowercases without any shift logic). No multi-
+// no separate upper/lowercase keycaps. No multi-
 // pass LIST-append handling for lines over the line editor's 79-char
 // limit -- not needed by the debug scenarios driving this port.
 
@@ -87,11 +86,11 @@ bool typeLine(PC1500Machine& machine, const std::string& line, bool pressEnter, 
 /// Types a whole BASIC program's source text in through the ROM's own
 /// PRO-mode line editor, one statement line at a time, tokenizing exactly
 /// as it would for a human typist (see file doc comment). Like the
-/// PC-1600's and the fast basic-binary loaders, it neither clears nor
+/// PC-1600's and the fast BASIC loaders, it neither clears nor
 /// resets anything first: the lines are added to whatever program is
 /// resident, and the caller must have left the machine ready to store
 /// lines (on a cold-booted machine, CL then NEW0 -- a preset's own
-/// `- key: cl` / `- type: NEW0` steps). A line that doesn't grow the
-/// program's stored size is collected into the result as rejected rather
-/// than aborting the load.
+/// `- key: cl` / `- type: NEW0` steps). A line that leaves the program
+/// unchanged (BASPRG_END put and its own line, if resident, not rewritten)
+/// is collected into the result as rejected rather than aborting the load.
 BasicTypeResult typeBasicProgramText(PC1500Machine& machine, const std::string& text);

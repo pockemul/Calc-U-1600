@@ -11,6 +11,7 @@ class MachineController;
 class MemoryModuleManager;
 class FloppyDiskManager;
 struct PresetFile;
+struct PresetLoadResult;
 
 // Orchestrates opening a preset file end to end (Core/PC1500/
 // PresetFile.hpp, PC1500PresetLoader.cpp / PC1600PresetLoader.cpp): parses
@@ -24,13 +25,6 @@ struct PresetFile;
 // installs a yield hook (setYieldHook()) that the machine calls
 // periodically from inside its run loop, so the window keeps repainting
 // and can show a "Loading..." popup instead of freezing.
-//
-// Only meaningful when CALCU1600_PRESET_LOADER_AVAILABLE is defined
-// (macOS for now -- see Qt6/CMakeLists.txt's CORE_SOURCES if(APPLE) block:
-// BASIC program loading needs the vendored Rust libsharpdx, currently only
-// built for macOS). MainWindow checks that macro itself and disables the
-// "Load Preset…" action instead of constructing this class when it's
-// undefined, so this header is safe to include unconditionally.
 class PresetController : public QObject {
     Q_OBJECT
 public:
@@ -44,7 +38,7 @@ public:
     // regardless of the return value. Returns false with *error set to a
     // user-facing message on failure (parse error, unsupported ROM
     // revision, a missing/rejected sibling file, etc).
-    bool loadPreset(const QString& path, QString* error);
+    bool loadPreset(const QString& path, QString* error, bool armOnly = false);
 
     // A model's default preset (AppSettings::defaultPresetPath()): same as
     // loadPreset(), but refuses -- touching nothing -- a preset that targets
@@ -55,8 +49,8 @@ public:
     // Loads a plain `.bas` listing directly into the *currently running*
     // machine -- no preset wrapper, no model/ROM/module rebuild (only a
     // reset). Runs the same "reset, reach PRO mode, NEW0, poke the
-    // tokenized payload in" choreography a preset's `format: basic-binary`
-    // program section relies on its own `keys:` block for (see
+    // tokenized payload in" choreography a preset's BASIC `program: file:`
+    // section relies on its own `keys:` block for (see
     // PC1500BasicLoader.hpp/PC1600BasicLoader.hpp's own doc comments), just
     // driven here instead of by preset steps. Synchronous on the calling
     // thread, same caller contract as loadPreset() (stop the frame timer
@@ -67,11 +61,10 @@ public:
     // *currently running* machine -- no reset, no BASIC involvement, just
     // the bytes. `slot` is PC-1600 only: 0 = S0, 1 / 2 = memory slots. Same
     // caller contract as the loaders above (stop the frame timer first).
-    // Doesn't need libsharpdx, so it works in every build.
     struct MachineCodeLoadRequest {
         std::vector<uint8_t> payload;
-        uint32_t addr = 0;
-        int slot = 0;
+        uint32_t addr = 0;  // where the bytes go: the Z-80 / LH5801 bus address
+        int slot = 0;       // PC-1600: machinecode::Slot from the plan / dialog
     };
     bool loadMachineCodeLive(const MachineCodeLoadRequest& request, QString* error);
 
@@ -98,13 +91,20 @@ signals:
     // this fires (see loadPreset()'s onArmed lambda), so a slot connected
     // here can safely refresh module combos and plotter-paper visibility
     // and repaint before the (possibly many-seconds-long) boot and preset
-    // script run. Never fired for a preset that fails before arming (a
-    // parse error, a bad modulespec, a missing plotter ROM, ...).
+    // script run. Also fired when arming fails part way (a bad slot module,
+    // a missing plotter ROM, ...), after the slot/floppy pickers were
+    // synced to what did attach; never for a preset that fails to parse.
     void armed();
 
 private:
-    // Shared tail of loadPreset()/loadDefaultPreset() once the file parsed.
+    // Shared tail of loadPreset()/loadDefaultPreset() once the file parsed:
+    // picks the model's run method, then reports its outcome.
     bool runPreset(const PresetFile& preset, QString* error);
+    // Per-model: build the bare machine, announce the model, apply the
+    // preset. `env` is the model-independent part (search dirs, log, saveas:).
+    struct PresetEnv;
+    PresetLoadResult runPC1500Preset(const PresetFile& preset, const PresetEnv& env);
+    PresetLoadResult runPC1600Preset(const PresetFile& preset, const PresetEnv& env);
 
     // Runs `body` with the yield hook installed on whichever machine is
     // active (the ScopedYieldHook template argument is the only thing the

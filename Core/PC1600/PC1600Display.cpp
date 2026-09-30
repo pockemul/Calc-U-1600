@@ -37,35 +37,42 @@ uint8_t PC1600Display::readIO(uint8_t port) {
     // left by every BASIC benchmark. 3 edges changes nothing, 4 edges gives
     // 5.854 s (real 5.894 s, i.e. the residual), 5 edges overshoots to
     // 6.257 s. Dampflok.bas drops from 1.8% to 0.87% slow with it. This is
-    // a fit, not a datasheet figure.
+    // a fit, not a datasheet figure, but it lies inside the datasheet's
+    // bound of 1/fCLK <= T_BUSY <= 3/fCLK. The 216.7 kHz CK0 drives the
+    // HD61203's CR pin (Service Manual key circuit diagram: master mode,
+    // FS = GND, R/C open), and the HD61203 divides it by two into
+    // phi1/phi2, so fCLK = 108.3 kHz (9.2-27.7 us). 3-4 CK0 periods are
+    // 13.8-18.5 us, about 2 phi cycles.
     //
     // Per-block offset (see class comment / writeIO's own comment for the
-    // full derivation): offset 1 = status read, offset 3 = data read.
+    // full derivation): offset 1 = status read, offset 3 = data read (the
+    // ROM's data reads at bank 6 `81E8`/`8AA2` use 57H/5BH).
     // Offsets 0/2 (the write-side command/data ports) have no defined
     // read meaning and fall through to the "both, default IC2" case
     // below, same as an unhandled port.
     uint8_t offset = port & 0x03;
 
-    // Status byte: bit7 = busy (see above); every other bit (reset
-    // status, ON/OFF echo) is left clear.
-    auto statusByte = [this](const Controller& c) -> uint8_t { return m_lcdEdges < c.busyUntilEdge ? 0x80 : 0x00; };
-    // Data byte: real HD61102 hardware lags one column behind the address
-    // pointer on reads -- a read returns the byte at `addressCol - 1`, NOT
-    // `addressCol`, then advances the pointer (the classic "first read
-    // after setting the address returns stale data" quirk: set column C,
-    // then the first read still returns column C-1's byte; only the
-    // SECOND read returns C, by which point the pointer reads back C-1
-    // again next time unless the caller re-homes it). Column-address
-    // writes and data writes both use `addressCol` directly with no such
-    // lag (see `writeCommand()`/`writeIO()`'s `apply()`); reads are the
-    // only lagged side. This lag matters because the ROM's cursor-blink
-    // routine does a real read-modify-write (read the cell, XOR the
-    // cursor pattern in, write it back) to toggle the cursor; without the
-    // lag it would XOR and write back the wrong column's byte, corrupting
-    // the neighboring cell a little more on every blink.
+    // Status byte (HD61102 datasheet, Hitachi 1989): DB7 = busy (see
+    // above), DB5 = ON/OFF with 1 = display *off* (the reverse of the
+    // instruction's D bit), DB4 = RESET. DB4 stays clear: no RST line is
+    // modelled, and the controllers are deliberately not reset on power-on
+    // (VGG keeps their RAM and registers). The ROM's busy-wait masks bit 7
+    // of each chip (`817F`: IN A,(59H) / RLA / IN A,(55H) / RRA / AND C0H).
+    auto statusByte = [this](const Controller& c) -> uint8_t {
+        uint8_t status = c.displayOn ? 0x00 : 0x20;
+        if (lcdEdges() < c.busyUntilEdge) status |= 0x80;
+        return status;
+    };
+    // Data byte: a read returns the controller's output register, which
+    // the previous read loaded. The read then latches the RAM cell at the
+    // current address into it and increments the column (datasheet Fig. 5).
+    // So the first read after setting an address returns stale data and
+    // the addressed byte comes with the second. The ROM does that dummy
+    // read (`81E8`: IN A,(C) discarded) before its real reads (`8AA2`), and
+    // its cursor-blink read-modify-write depends on it.
     auto dataByte = [](Controller& c) -> uint8_t {
-        uint8_t laggedCol = (c.addressCol == 0) ? 63 : static_cast<uint8_t>(c.addressCol - 1);
-        uint8_t v = c.pages[laggedCol][c.addressPage];
+        uint8_t v = c.outputReg;
+        c.outputReg = c.pages[c.addressCol][c.addressPage];
         c.addressCol = static_cast<uint8_t>((c.addressCol + 1) & 0x3F);
         return v;
     };
@@ -91,7 +98,7 @@ void PC1600Display::writeIO(uint8_t port, uint8_t value) {
     bool isData = (offset == 2);
 
     auto apply = [&](Controller& c) {
-        if (offset == 0 || isData) c.busyUntilEdge = m_lcdEdges + kBusyClocks;
+        if (offset == 0 || isData) c.busyUntilEdge = lcdEdges() + kBusyClocks;
         if (!isData) {
             if (offset == 0) writeCommand(c, value);
             return; // offset 1/3: read-only, no write-side meaning
@@ -179,30 +186,12 @@ void PC1600Display::refreshStatusSymbols() {
     m_statusLine.set(Symbol::Grad,     bit(b01, 1));
     m_statusLine.set(Symbol::Deg,      bit(b01, 0));
 
-    // Kbii (the "カナ" romaji->kana legend) is a real, independently-driven
-    // segment at b02 bit7 -- but one this ROM never lights, so on a western
-    // machine it stays dark forever. That is faithful, not dead code.
-    //
-    // SMBLSET (bank 6, 822DH-8239H) implements the TRM's own "if either
-    // KBII or S is set to 1, the S symbol is shown" rule in firmware: for
-    // symbol set 2 it masks bits 3 and 7 out of the caller's byte
-    // (`AND 77H`) and, if either was set, lights bit 3 -- S -- alone
-    // (`OR 08H`). So the panel byte can never carry bit7 with this
-    // firmware, and pressing KBII shows up as S.
-    //
-    // The glass itself carries both legends: with the contrast cranked up
-    // far enough to reveal unlit segments, "カナ" is etched alongside "S"
-    // even on a western unit. Same panel, same segment wiring; which of
-    // the two lights is a ROM decision, and a Japanese machine's firmware
-    // is assumed to drive bit7 for kana-entry mode where this one folds
-    // into S. Reading the bit straight off the panel keeps both cases
-    // right without special-casing either.
-    //
-    // (The KBII *mode* flag is a different thing living elsewhere -- RAM
-    // F3C6H bit7, SMBLSET's own pre-fold shadow, which is what the key-code
-    // translator reads to select the alternate charset table. It is machine
-    // state, not a panel segment, so it is deliberately not surfaced here.)
-    m_statusLine.set(Symbol::Kbii, bit(b02, 7));
+    // The romaji->kana caption: X35 = page 4 bit 2, X59 = page 7 bit 2
+    // (Service Manual glass pinout; see PC1600StatusLine.hpp). KBII's bit 7
+    // has no electrode -- SMBLSET (bank 6 822DH) folds it into S -- so it
+    // is not read.
+    m_statusLine.set(Symbol::Romaji, bit(b02, 2));
+    m_statusLine.set(Symbol::Kana,   bit(b00, 2));
     m_statusLine.set(Symbol::S,    bit(b02, 3));
     m_statusLine.set(Symbol::Ctrl, bit(b02, 1));
     m_statusLine.set(Symbol::Batt, bit(b02, 0));

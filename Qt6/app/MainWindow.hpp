@@ -12,7 +12,12 @@
 
 class QTimer;
 class QKeyEvent;
+namespace PC1500KeyboardMap { struct ResolvedKey; }
 class QCloseEvent;
+class QDragEnterEvent;
+class QDragMoveEvent;
+class QDropEvent;
+class QMimeData;
 class QHBoxLayout;
 class QAction;
 class QActionGroup;
@@ -20,12 +25,14 @@ class FaceplateWidget;
 class ControlBar;
 class DebugPanel;
 class PlotterController;
+class SyncOperations;
 class PlotterPaperWidget;
 class Ce158PrinterWidget;
 class MemoryModuleManager;
 class FloppyDiskManager;
 class PresetController;
 class AudioOutput;
+class EmulationPacer;
 
 // Top-level window: FaceplateWidget (stretch) over ControlBar (fixed) over
 // the debug row (fixed), all inside a central QWidget (QMainWindow requires
@@ -50,17 +57,11 @@ public:
     ~MainWindow();
 
     // ── Scripted screenshots (screenshots/ShotRunner) ──────────────────
-    // The emulator normally runs off the ~60 Hz frame timer. A shot run
-    // freezes it, so every capture sees exactly the state its steps left
+    // The emulator normally runs off the pacer's ~60 Hz frame timer. A shot
+    // run freezes it, so every capture sees exactly the state its steps left
     // behind (no cursor blink, no clock drift between runs), and advances
-    // it explicitly instead.
-    void setEmulationFrozen(bool frozen);
-    // Runs `seconds` of emulated time in frame-sized slices, then refreshes
-    // every view (LCD, debug log, paper) as a frame tick would.
-    void runEmulation(double seconds);
-    // Runs until a MachineController::pasteText() has been fully typed;
-    // false if it is still typing after `capSeconds` of emulated time.
-    bool runUntilPasteDone(double capSeconds);
+    // it explicitly instead (see EmulationPacer).
+    EmulationPacer* pacer() const { return m_pacer; }
     // Load Preset… without the file dialog, and with a failure reported
     // through `error` instead of a blocking warning box.
     bool loadPresetForShots(const QString& path, QString* error);
@@ -69,9 +70,10 @@ public:
         resetMachine(allReset);
         refreshViewsAfterAdvance();
     }
-    // True while runSynchronousLoad() is mid-load: it pumps the event loop
-    // (timers included), and nothing may drive the machine until it's done.
-    bool isLoading() const { return m_loading; }
+    // True while a synchronous operation (SyncOperations) is running: it
+    // pumps the event loop (timers included), and nothing may drive the
+    // machine until it's done.
+    bool isLoading() const;
     MachineController* controller() const { return m_controller.get(); }
     // `screen` (MachineController::currentScreenImage()) as a QImage at its
     // physical size (dots per metre set), as Copy Screen puts it on the
@@ -80,14 +82,30 @@ public:
     FaceplateWidget* faceplate() const { return m_faceplate; }
     PlotterPaperWidget* plotterPaper() const { return m_plotterPaper; }
 
+    // A file dropped onto the window, or (macOS) onto the Dock icon / opened
+    // from Finder: its content picks the loader (Core/DropFile) -- Load
+    // Preset, Load BASIC Program or Load Machine Code, as from the menu.
+    // Anything else is ignored silently. Held back until the startup preset
+    // is done and while a synchronous operation runs (the last one wins).
+    void openDroppedFile(const QString& path);
+
 protected:
     void keyPressEvent(QKeyEvent* event) override;
     void keyReleaseEvent(QKeyEvent* event) override;
+    // Composed text from the OS input method (dead keys: ¨ then U gives Ü,
+    // Linux compose): committed characters are typed as taps.
+    void inputMethodEvent(QInputMethodEvent* event) override;
+    QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
     void changeEvent(QEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
+    void dragEnterEvent(QDragEnterEvent* event) override;
+    void dragMoveEvent(QDragMoveEvent* event) override;
+    void dropEvent(QDropEvent* event) override;
 
 private:
+    void typeResolved(const PC1500KeyboardMap::ResolvedKey& resolved, QKeyEvent* event);
+
     std::unique_ptr<MachineController> m_controller;
     std::unique_ptr<MemoryModuleManager> m_moduleManager;
     std::unique_ptr<FloppyDiskManager> m_floppyManager;
@@ -97,20 +115,12 @@ private:
     ControlBar* m_controlBar = nullptr;
     DebugPanel* m_debugPanel = nullptr;
     PlotterPaperWidget* m_plotterPaper = nullptr; // added to m_debugRowLayout only while a plotter is attached
-    bool m_plotterPaperInLayout = false;
     Ce158PrinterWidget* m_ce158Printer = nullptr; // added to m_debugRowLayout only while a CE-158 is attached
-    bool m_ce158PrinterInLayout = false;
     QWidget* m_debugRow = nullptr;
     QHBoxLayout* m_debugRowLayout = nullptr;
-    QTimer* m_frameTimer = nullptr;
-    bool m_turboActive = false; // press-and-hold on the LCD: run unthrottled
     AudioOutput* m_audio = nullptr;
-    // Real-time pacing for onFrameTick(): each tick runs exactly the
-    // emulated time that has passed on the wall clock since the previous
-    // one (restartPacing() rebases it whenever the frame timer (re)starts).
-    QElapsedTimer m_paceClock;
-    double m_cycleCarry = 0.0;
-    void restartPacing();
+    EmulationPacer* m_pacer = nullptr; // owns the frame timer; calls refreshViewsAfterAdvance()
+    SyncOperations* m_sync = nullptr;  // every synchronous load/reset (see SyncOperations)
 
     void buildMenuBar();
 
@@ -163,6 +173,8 @@ private:
     QAction* m_openPresetAction = nullptr;
     QAction* m_loadBasicProgramAction = nullptr;
     QAction* m_loadMachineCodeAction = nullptr;
+    QAction* m_mountDirectoryAction = nullptr;   // File > Mount Directory… (PC-1600 host drive S3:)
+    QAction* m_unmountDirectoryAction = nullptr;
     QAction* m_settingsAction = nullptr;
     QAction* m_aboutAction = nullptr;
 
@@ -175,14 +187,12 @@ private:
     // (manual, module-driven rebuild, or preset load).
     void syncControlBarForModel();
 
-    // CE-150/CE-1600P attach-state handler, shared by both
-    // PlotterController::ce150AttachedChanged/ce1600pAttachedChanged
-    // signals: they only differ in which plotter is "self" vs "other".
-    void onPlotterAttachedChanged(bool isCE150, bool attached);
-    void onCe158AttachedChanged(bool attached);
-    // Enables/checks the CE-150/CE-1600P/CE-158 buttons from their attach
-    // states (shared by both handlers above).
-    void syncPeripheralButtons(bool ce150Attached, bool ce1600pAttached, bool ce158Attached);
+    // PlotterController::attachStateChanged handler: reads the CE-150/
+    // CE-1600P/CE-158 attach states from MachineController and matches the
+    // control-bar buttons, the floppy picker and the docked panes to them.
+    void syncPeripherals();
+    // Docks `pane` into (or takes it out of) the debug row.
+    void setDockedPane(QWidget* pane, bool show);
 
     // PresetController::armed handler: the preset has attached its
     // model/cards/plotter but the machine is still powered off. Resyncs
@@ -192,19 +202,26 @@ private:
     // user briefly sees the armed-but-off machine.
     void onPresetArmed();
 
-    // Shared choreography for Load Preset/Load BASIC Program: stops the
-    // frame timer and shows a wait cursor around the (synchronous) `loadFn`
-    // call so nothing else drives the machine mid-script, runs `afterLoad`
-    // (if given) before the timer restarts, then reports `loadFn`'s error
-    // via a warning dialog titled `errorTitle` on failure.
-    void runSynchronousLoad(const QString& errorTitle, const std::function<bool(QString*)>& loadFn,
-                             const std::function<void()>& afterLoad = {});
-
     // File > Load Machine Code…: pick a .bin (Settings' Assembly folder),
-    // recognise its header, ask for a start address / PC-1600 slot only when
-    // needed (MachineCodeLoadDialog), write it, then show the NEW that
-    // protects it and the CALL that starts it. Never runs the code.
+    // then loadMachineCodeFile(): recognise its header, ask for a start
+    // address / PC-1600 slot only when needed (MachineCodeLoadDialog), write
+    // it, then show the NEW that protects it and the CALL that starts it.
+    // Never runs the code.
     void loadMachineCode();
+    // The three loaders behind the File menu's dialogs and a drop. Each
+    // remembers the file's folder for its dialog.
+    void loadPresetFile(const QString& path);
+    void loadBasicProgramFile(const QString& path);
+    void loadMachineCodeFile(const QString& path);
+    // The one local file a drag carries, if its content is something to
+    // load (openDroppedFile()); empty otherwise.
+    QString droppableFile(const QMimeData* mime) const;
+    void drainPendingDrop();
+    QString m_pendingDrop;       // a drop that arrived while loading / before startup finished
+    bool m_startupDone = false;  // the startup preset (if any) has run
+    void mountHostDirectory();
+    void unmountHostDirectory();
+    void syncHostDriveActions();
     // Reset / Reset All (control bar, Machine menu): see resetMachine() in
     // MainWindow.cpp.
     void resetMachine(bool allReset);
@@ -230,11 +247,10 @@ private:
     // press, a mouse press, or losing focus disarms it.
     bool m_shiftTapArmed = false;
     QElapsedTimer m_shiftTapClock;
+    void armShiftTap();
+    void disarmShiftTap();
 
-    void onFrameTick();
     // The per-frame view refresh (LCD, debug log, paper, floppy lamp,
-    // persistence) -- shared by onFrameTick() and runEmulation().
+    // persistence) -- run by the pacer after each advance.
     void refreshViewsAfterAdvance();
-    bool m_emulationFrozen = false;
-    bool m_loading = false; // see isLoading()
 };

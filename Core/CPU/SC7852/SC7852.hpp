@@ -3,6 +3,9 @@
 #include <cstdint>
 
 #include "../../TraceTypes.hpp"
+#include "../HistoryRing.hpp"
+#include "../WatchSet.hpp"
+#include "../BreakpointSet.hpp"
 #include "../TraceRing.hpp"
 
 // ── Bus interface ────────────────────────────────────────────────────────
@@ -29,6 +32,15 @@ public:
     /// forwarded since nothing in this project's scope needs them yet.
     virtual uint8_t readIO(uint8_t port) { (void)port; return 0xFF; }
     virtual void    writeIO(uint8_t port, uint8_t value) { (void)port; (void)value; }
+
+    /// The maskable INT pin, a level like the real one. step() reads it at
+    /// the start of every call: while it is asserted, an interrupt is
+    /// accepted if IFF1 is set and the previous instruction was not EI;
+    /// otherwise nothing happens (a HALTed CPU stays HALTed). Accepting it
+    /// does not drop the level -- the device does, once the handler clears
+    /// its cause. The board computes it from its own state when asked, so
+    /// nothing has to push updates.
+    virtual bool interruptLevel() const { return false; }
 };
 
 // ── SC7852 CPU core ──────────────────────────────────────────────────────
@@ -104,7 +116,7 @@ public:
     bool     iff2() const { return IFF2; }
     uint8_t  im() const { return IM; }
     bool     halted() const { return m_halted; }
-    bool     intLine() const { return m_intLine; }
+    bool     intLine() const { return bus.interruptLevel(); }
     /// Clears HALT without going through the interrupt path -- used by
     /// PC1600BusArbiter/PC1600Machine to resume the SC7852 when bus
     /// ownership switches back to it after parking on
@@ -123,6 +135,21 @@ public:
     void setSP(uint16_t v) { SP = v; }
     void setPC(uint16_t v) { PC = v; }
 
+    // Alternate set and control registers (debugger).
+    uint16_t af2() const { return uint16_t(A2 << 8) | F2; }
+    uint16_t bc2() const { return uint16_t(B2 << 8) | C2; }
+    uint16_t de2() const { return uint16_t(D2 << 8) | E2; }
+    uint16_t hl2() const { return uint16_t(H2 << 8) | L2; }
+    void setAF2(uint16_t v) { A2 = uint8_t(v >> 8); F2 = uint8_t(v); }
+    void setBC2(uint16_t v) { B2 = uint8_t(v >> 8); C2 = uint8_t(v); }
+    void setDE2(uint16_t v) { D2 = uint8_t(v >> 8); E2 = uint8_t(v); }
+    void setHL2(uint16_t v) { H2 = uint8_t(v >> 8); L2 = uint8_t(v); }
+    void setI(uint8_t v) { I = v; }
+    void setR(uint8_t v) { R = v; }
+    void setIM(uint8_t v) { IM = uint8_t(v > 2 ? 2 : v); }
+    void setIFF1(bool v) { IFF1 = v; }
+    void setIFF2(bool v) { IFF2 = v; }
+
     bool flagS()  const { return (F & 0x80) != 0; }
     bool flagZ()  const { return (F & 0x40) != 0; }
     bool flagH()  const { return (F & 0x10) != 0; }
@@ -130,15 +157,10 @@ public:
     bool flagN()  const { return (F & 0x02) != 0; }
     bool flagC()  const { return (F & 0x01) != 0; }
 
-    /// Drives the maskable INT line (a level, like the real pin). While it
-    /// is asserted, an interrupt is accepted at the start of a step() call
-    /// if IFF1 is set and the previous instruction was not EI; otherwise
-    /// nothing happens (a HALTed CPU stays HALTed). Accepting it does not
-    /// drop the line -- the device does, once the handler clears its cause.
     /// PC-1600's IM2 vector byte (Port 39H, low byte of the vector address;
     /// I register supplies the high byte) is the caller's responsibility to
-    /// have wired up via setIM2VectorByte() before requesting.
-    void setIntLine(bool asserted) { m_intLine = asserted; }
+    /// have wired up via setIM2VectorByte() before INT is asserted (see
+    /// SC7852Bus::interruptLevel()).
     void setIM2VectorByte(uint8_t low) { m_im2VectorLow = low; }
 
     /// Non-maskable interrupt (NMI): always serviced, clears IFF1 (saving
@@ -157,6 +179,32 @@ public:
 
     uint32_t drainTraceEvents(Z80CpuFrame* out, uint32_t max, uint32_t* outLost) { return m_trace.drain(out, max, outLost); }
 
+    // ── Debugger hooks ────────────────────────────────────────────────────
+    /// PC breakpoints, checked at the start of each instruction (never
+    /// between a DD/FD prefix and its opcode) while enabled. A hit makes
+    /// step() return 0 without executing anything.
+    void setBreakpointsEnabled(bool on) { m_breakpointsEnabled = on; }
+    bool breakpointsEnabled() const { return m_breakpointsEnabled; }
+    void addBreakpoint(uint16_t addr) { m_breakpoints.add(addr); }
+    void removeBreakpoint(uint16_t addr) { m_breakpoints.remove(addr); }
+    void clearBreakpoints() { m_breakpoints.clear(); }
+    /// Returns true once per hit; call after a step() that returned 0.
+    bool consumeBreakpointHit() { return m_breakpoints.consumeHit(); }
+    /// Continue from a breakpoint: the instruction at the current PC
+    /// executes once even though it is a breakpoint. The skip is tied to
+    /// that address, so an interrupt taken first can't spend it on its
+    /// handler; it lasts until that instruction runs or the next call.
+    void resumePastBreakpoint() { m_skipBreakpointAt = PC; }
+    void clearBreakpointSkip() { m_skipBreakpointAt = -1; }
+    /// Data breakpoints; see LH5801::setWatches(). Not owned.
+    void setWatches(WatchSet* watches) { m_watches = watches; }
+
+    /// The debugger's always-on history of the last retired instructions
+    /// (see HistoryRing.hpp). Recorded on every step() regardless of the
+    /// TRACE_* flags; cleared by reset().
+    using History = HistoryRing<Z80HistoryFrame, 32>;
+    const History& history() const { return m_history; }
+
 private:
     SC7852Bus& bus;
 
@@ -168,16 +216,20 @@ private:
     bool IFF1{false}, IFF2{false};
     uint8_t IM{0};
     bool m_halted{false};
-    bool m_intLine{false};    // an input driven by the board (setIntLine()); reset() leaves it
     bool m_nmiPending{false};
     uint8_t m_pendingPrefix{0}; // a DD/FD fetched but not yet executed (see step())
     bool m_eiShadow{false};   // set by EI: blocks INT acceptance for one instruction
     uint8_t m_im2VectorLow{0xFF};
 
+    // ── Data access (checked against m_watches) ──────────────────────────
+    uint8_t dataRead(uint16_t a) { uint8_t v = bus.readMem(a); if (m_watches) m_watches->check(a, v, false, 0); return v; }
+    void dataWrite(uint16_t a, uint8_t v) { if (m_watches) m_watches->check(a, v, true, 0); bus.writeMem(a, v); }
+
     // ── Fetch helpers ────────────────────────────────────────────────────
     uint8_t  fetchOpcode(); // an M1 cycle: also advances R
     uint8_t  fetch8();      // operand/displacement byte: R untouched
     uint16_t fetch16(); // little-endian: low byte first, then high
+    uint8_t  readCode();    // the one PC-relative read all three use; mirrors the byte into the history frame
     void     bumpR() { R = uint8_t((R & 0x80) | ((R + 1) & 0x7F)); }
 
     // ── Flag helpers ─────────────────────────────────────────────────────
@@ -230,13 +282,13 @@ private:
 
     /// Returns the cycle cost if an interrupt was actually serviced (PC
     /// redirected to a handler) this call, or -1 if nothing happened (no
-    /// interrupt pending, or only a maskable one that IFF1 or
-    /// `maskableBlocked` -- the EI shadow -- holds off). step() uses -1 to mean "go ahead
+    /// NMI pending and `takeInt` false). `takeInt` is step()'s verdict on the
+    /// maskable INT: level asserted, IFF1 set, no EI shadow. step() uses -1 to mean "go ahead
     /// and fetch/execute a normal opcode this call" -- servicing an
     /// interrupt and executing the next opcode never happen in the same
     /// step() call, matching real hardware (the interrupt ack cycle IS
     /// the whole "instruction" for that cycle).
-    int serviceInterrupt(bool maskableBlocked);
+    int serviceInterrupt(bool takeInt);
 
     // ── Trace state ──
     std::atomic<uint32_t> m_traceFlags{TRACE_NONE};
@@ -247,5 +299,19 @@ private:
     // one pass. 65536 frames is ~1.9 MB.
     TraceRing<Z80CpuFrame, 65536> m_trace;
 
-    void recordTraceFrame(uint32_t tf, uint16_t pcAtStart, uint16_t opcodeWord, uint8_t cycles);
+    /// Records a TRACE frame if `tf` asks for one. The flag test is inline
+    /// so the untraced hot path pays no call.
+    void recordTraceFrame(uint32_t tf, uint16_t pcAtStart, uint16_t opcodeWord, uint8_t cycles) {
+        if (tf & (TRACE_PC | TRACE_REGS_LIGHT | TRACE_REGS_FULL)) pushTraceFrame(tf, pcAtStart, opcodeWord, cycles);
+    }
+    void pushTraceFrame(uint32_t tf, uint16_t pcAtStart, uint16_t opcodeWord, uint8_t cycles);
+
+    History m_history;
+    BreakpointSet m_breakpoints;
+    WatchSet* m_watches{nullptr};
+    bool m_breakpointsEnabled{false};
+    int32_t m_skipBreakpointAt{-1}; // resumePastBreakpoint(); -1 = none
+    Z80HistoryFrame* m_historyFrame{&m_history.next()}; // the frame the current step() fills
+    uint8_t m_fetchLen{0}; // bytes fetched by the current step(), mirrored into *m_historyFrame
+    void recordHistory(uint16_t pcAtStart, bool interrupt);
 };

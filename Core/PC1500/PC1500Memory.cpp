@@ -4,26 +4,12 @@
 #include <cstdio>
 #include <vector>
 
-#include "../Connector/ExpansionConnector.hpp"
-#include "../Connector/SystemBus.hpp"
-
-namespace {
-// The CE-150's LH5810 register block lives in ME1 at 0xB008-0xB00F (see
-// Core/Connector/Ce150Card.hpp). On real hardware that range also aliases
-// the internal LH5811 -- isIoChipAddress() matches any ME1 address with
-// bits 12-13 set -- and the firmware only avoids the clash by always
-// addressing its own chip at 0xF00x. A 60-pin card that claims this window
-// decodes it itself, so readME1()/writeME1() give the SystemBus first
-// refusal here; with no card on the chain SystemBus::{read,write}ME1
-// returns false and the internal-chip path below runs unchanged.
-constexpr uint16_t kCe150IoBase = 0xB008;
-constexpr uint16_t kCe150IoEnd  = 0xB00F;
-} // namespace
-
 PC1500Memory::PC1500Memory(PC1500Variant variant)
     : m_variant(variant),
       m_userRamSize(variant == PC1500Variant::PC1500A ? kUserRamSizeA : kUserRamSizePlain),
-      m_systemRamAddrMask(variant == PC1500Variant::PC1500A ? 0x7FF : 0x3FF) {
+      m_systemRamAddrMask(variant == PC1500Variant::PC1500A ? 0x7FF : 0x3FF),
+      m_expansionConnector(variant),
+      m_systemBus(variant) {
     m_rom.fill(0xFF);  // open until a ROM is loaded
     // Power-up: user CMOS RAM that has lost its supply comes back (mostly)
     // zero on real hardware, not 0xFF -- modelled as all 0x00. The 1.5K at
@@ -74,8 +60,7 @@ void PC1500Memory::reset() {
 }
 
 bool PC1500Memory::inhibitAsserted() const {
-    return (m_expansionConnector && m_expansionConnector->inhibitAsserted()) ||
-           (m_systemBus && m_systemBus->inhibitAsserted());
+    return m_expansionConnector.inhibitAsserted() || m_systemBus.inhibitAsserted();
 }
 
 const uint8_t* PC1500Memory::resolve(uint16_t addr, bool forWrite) const {
@@ -123,8 +108,8 @@ uint8_t PC1500Memory::readOpenBus(uint16_t addr) const {
     // 0xFF. Consulted on every access in these ranges, not a memory-map
     // shortcut.
     uint8_t v;
-    if (m_expansionConnector && m_expansionConnector->read(addr, m_pu, m_pv, v)) return v;
-    if (m_systemBus && m_systemBus->read(addr, m_pu, m_pv, v)) return v;
+    if (m_expansionConnector.read(addr, m_pu, m_pv, v)) return v;
+    if (m_systemBus.read(addr, m_pu, m_pv, v)) return v;
     return 0xFF;
 }
 
@@ -135,8 +120,8 @@ uint8_t PC1500Memory::readME0(uint16_t addr) {
 
 void PC1500Memory::writeME0(uint16_t addr, uint8_t value) {
     if (uint8_t* p = resolve(addr, /*forWrite=*/true)) { *p = value; return; }
-    if (m_expansionConnector && m_expansionConnector->write(addr, m_pu, m_pv, value)) return;
-    if (m_systemBus && m_systemBus->write(addr, m_pu, m_pv, value)) return;
+    if (m_expansionConnector.write(addr, m_pu, m_pv, value)) return;
+    if (m_systemBus.write(addr, m_pu, m_pv, value)) return;
 }
 
 uint8_t PC1500Memory::peek(uint16_t addr) const {
@@ -146,10 +131,10 @@ uint8_t PC1500Memory::peek(uint16_t addr) const {
 
 bool PC1500Memory::debugSlotResponds(uint16_t addr) const {
     uint8_t v;
-    return m_expansionConnector && m_expansionConnector->read(addr, m_pu, m_pv, v);
+    return m_expansionConnector.read(addr, m_pu, m_pv, v);
 }
 
-void PC1500Memory::poke(uint16_t addr, uint8_t value) {
+bool PC1500Memory::poke(uint16_t addr, uint8_t value) {
     // Same address decode as writeME0(), but flagged `direct` on the
     // connector path: this is the host/debug/preset-loader write, not a
     // guest-CPU store, so a card that gates runtime writes (the CE-163F's
@@ -157,21 +142,51 @@ void PC1500Memory::poke(uint16_t addr, uint8_t value) {
     // unconditionally. The preset loader has no concept of a bank or a lock
     // -- it just pokes the currently-selected bank -- which is exactly the
     // semantics a debug poke wants too.
-    if (uint8_t* p = resolve(addr, /*forWrite=*/true)) { *p = value; return; }
-    if (m_expansionConnector &&
-        m_expansionConnector->write(addr, m_pu, m_pv, value, /*direct=*/true)) return;
+    if (uint8_t* p = resolve(addr, /*forWrite=*/true)) { *p = value; return true; }
+    if (const WriteResult r = m_expansionConnector.write(addr, m_pu, m_pv, value, /*direct=*/true))
+        return r.stored;
     // SystemBus (60-pin) carries no lock-gating card today, so a plain
     // write is enough -- PinState::direct defaults false, matching the
     // pre-`direct` behavior.
-    if (m_systemBus && m_systemBus->write(addr, m_pu, m_pv, value)) return;
+    return m_systemBus.write(addr, m_pu, m_pv, value).stored;
+}
+
+uint8_t PC1500Memory::debugPeekME1(uint16_t addr, bool* readable) const {
+    *readable = true;
+    // Same order as readME1(); a card register a read would disturb stays
+    // unread (see ExpansionCard::readHasSideEffects).
+    uint8_t v;
+    if (m_systemBus.me1ReadHasSideEffects(addr, m_pu, m_pv)) {
+        *readable = false;
+        return 0xFF;
+    }
+    if (m_systemBus.readME1(addr, m_pu, m_pv, v)) return v;
+    if (isIoChipAddress(addr)) {
+        switch (addr & 0xF) {
+            case 0xC: return m_dda;
+            case 0xE: return m_opa;
+            case 0xD: return m_ddb;
+            case 0xF: return m_opb;
+            case 0x8: return m_opc;
+            case 0xB: return m_if;
+            default: return m_ioScratchRegs[addr & 0xF];
+        }
+    }
+    return peek(addr);
 }
 
 uint8_t PC1500Memory::readME1(uint16_t addr) {
-    // A CE-150 (or any 60-pin card) claiming the LH5810 window shadows the
-    // internal I/O chip that also aliases it -- see kCe150IoBase's comment.
-    if (m_systemBus && addr >= kCe150IoBase && addr <= kCe150IoEnd) {
+    // Only the 60-pin SystemBus carries ME1 (the 40-pin connector has no
+    // equivalent), and a card there gets first refusal on every ME1
+    // access. A card register inside the internal LH5811's broad decode
+    // (isIoChipAddress() matches any ME1 address with bits 12-13 set)
+    // shadows it: the CE-150's LH5810 at 0xB008-0xB00F is exactly such a
+    // clash, which the firmware avoids by addressing its own chip at
+    // 0xF00x. The host doesn't need to know which card sits where; with no
+    // card on the chain this falls straight through.
+    {
         uint8_t v;
-        if (m_systemBus->readME1(addr, m_pu, m_pv, v)) return v;
+        if (m_systemBus.readME1(addr, m_pu, m_pv, v)) return v;
     }
     if (isIoChipAddress(addr)) {
         switch (addr & 0xF) { // RS0-3 = AD0-3
@@ -196,22 +211,12 @@ uint8_t PC1500Memory::readME1(uint16_t addr) {
             default: return m_ioScratchRegs[addr & 0xF]; // serial/etc: not modeled, but read back what was written
         }
     }
-    // Only the 60-pin SystemBus exposes DME1/ME1 (the 40-pin connector has
-    // no equivalent) -- give it first refusal before falling back to the
-    // ME0 mirror, resolving this file's earlier "flagged for revisit once
-    // Phase 4's ExpansionConnector work clarifies ME1's remaining role."
-    if (m_systemBus) {
-        uint8_t v;
-        if (m_systemBus->readME1(addr, m_pu, m_pv, v)) return v;
-    }
     return readME0(addr); // no other documented ME1 wiring -- conservative mirror
 }
 
 void PC1500Memory::writeME1(uint16_t addr, uint8_t value) {
-    // See readME1(): a 60-pin card claiming the LH5810 window gets it first.
-    if (m_systemBus && addr >= kCe150IoBase && addr <= kCe150IoEnd) {
-        if (m_systemBus->writeME1(addr, m_pu, m_pv, value)) return;
-    }
+    // See readME1(): a 60-pin card gets first refusal on every ME1 access.
+    if (m_systemBus.writeME1(addr, m_pu, m_pv, value)) return;
     if (isIoChipAddress(addr)) {
         switch (addr & 0xF) {
             case 0xC: m_dda = value; return;
@@ -234,7 +239,6 @@ void PC1500Memory::writeME1(uint16_t addr, uint8_t value) {
             default: m_ioScratchRegs[addr & 0xF] = value; return; // serial/etc: not modeled, but not discarded either
         }
     }
-    if (m_systemBus && m_systemBus->writeME1(addr, m_pu, m_pv, value)) return;
     writeME0(addr, value);
 }
 

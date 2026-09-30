@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "ExpansionCard.hpp"
+#include "../PC1500/PC1500Clocks.hpp"
 #include "../Serial/SerialLink.hpp"
 
 // ── CE-158 RS-232C / Centronics interface (60-pin bus) ──────────────────
@@ -89,9 +90,9 @@ public:
     static constexpr uint8_t kStatusTHRE = 0x80; // transmitter holding register empty
 
     /// The default unit tick() counts in: PC1500Machine ticks the card
-    /// with LH5801 cycles (same value as Upd1990ac::kCpuHz). The PC-1600
-    /// ticks it with SC7852 T-states and sets its own rate (setClockHz).
-    static constexpr double kCpuHz = 1300000.0;
+    /// with LH5801 cycles. The PC-1600 ticks it with SC7852 T-states and
+    /// sets its own rate (setClockHz).
+    static constexpr double kCpuHz = kPC1500CpuHz;
 
     /// Rate of the units tick() is given in. Recomputes the character time.
     void setClockHz(double hz) {
@@ -195,6 +196,8 @@ public:
             }
             return false;
         }
+        // PV/PU read from their 40-pin contacts 2/3 -- a shortcut until the
+        // 60-pin connector is modelled (TODO.md, "Expansion connectors").
         if (pins.forWrite || !pins.pin[2] /*PV*/) return false;
         if (addr < kRomBase || addr > kRomEnd || !m_romLoaded) return false;
         const size_t bank = pins.pin[3] /*PU*/ ? kBankSize : 0;
@@ -202,12 +205,19 @@ public:
         return true;
     }
 
-    bool respondsToWrite(const PinState& pins, uint8_t value) override {
-        if (!pins.me1) return false; // ROM window is read-only
+    /// The ME1 register blocks (a UART RX read clears status flags): a
+    /// debugger must not read them as memory.
+    bool readHasSideEffects(const PinState& pins) const override {
+        const uint16_t addr = pins.address;
+        return pins.me1 && ((addr >= kPioBase && addr <= kUartEnd) || (addr >= kIntIdBase && addr <= kIntIdEnd));
+    }
+
+    WriteResult respondsToWrite(const PinState& pins, uint8_t value) override {
+        if (!pins.me1) return WriteResult::ignored(); // ROM window is read-only
         const uint16_t addr = pins.address;
         if (addr >= kPioBase && addr <= kPioEnd) {
             writePio(uint8_t(addr & 0x0F), value);
-            return true;
+            return WriteResult::taken();
         }
         if (addr >= kUartBase && addr <= kUartEnd) {
             if (addr & 1) {
@@ -220,10 +230,10 @@ public:
                 m_txPending = true;
                 m_uartStatus &= uint8_t(~(kStatusTHRE | kStatusTSRE));
             }
-            return true;
+            return WriteResult::taken();
         }
-        if (addr >= kIntIdBase && addr <= kIntIdEnd) return true; // read-only; claimed
-        return false;
+        if (addr >= kIntIdBase && addr <= kIntIdEnd) return WriteResult::refused(); // read-only; claimed
+        return WriteResult::ignored();
     }
 
 private:

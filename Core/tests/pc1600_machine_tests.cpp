@@ -7,6 +7,9 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <deque>
+#include <initializer_list>
+#include <string>
 #include <vector>
 
 #include "../PC1600/PC1600Machine.hpp"
@@ -184,10 +187,9 @@ void test_yield_hook_fires_per_interval_across_runcycles_calls() {
     CHECK(calls == 5);
 }
 
-void test_half_second_signal_toggles_off_the_05s_accumulator() {
-    // The sub-CPU's 0.5 s signal (bit 1 of request 5DH) must actually
-    // toggle for the file/RAM-disk IOCS readiness handshake to progress --
-    // step()'s 0.5 s accumulator drives it.
+void test_half_second_tick_raises_srirq_bit1() {
+    // The sub-CPU's 0.5 s tick raises SRIRQ (A2H) bit 1; step()'s 0.5 s
+    // accumulator drives it, and the SRIRQ read clears it.
     PC1600Machine m;
     std::vector<uint8_t> lower = makeBank(0x00);
     std::vector<uint8_t> upper = makeBank(0x00);
@@ -195,13 +197,15 @@ void test_half_second_signal_toggles_off_the_05s_accumulator() {
     CHECK(m.loadBank0(lower.data(), lower.size(), upper.data(), upper.size()));
     m.reset();
 
-    const bool start = m.memory().subCpu().halfSecondSignal();
+    auto& sub = m.memory().subCpu();
+    sub.strobe(0xA2); (void)sub.readAnswer(); // start from nothing pending
+    CHECK((sub.pendingInterrupts() & PC1600SubCpu::kIrqHalfSecond) == 0);
     // Just over one 0.5 s period of emulated time.
     m.runCycles(PC1600Machine::kTStateHz / 2 + PC1600Machine::kTStateHz / 20);
-    CHECK(m.memory().subCpu().halfSecondSignal() != start);
-    // A second period brings it back.
-    m.runCycles(PC1600Machine::kTStateHz / 2 + PC1600Machine::kTStateHz / 20);
-    CHECK(m.memory().subCpu().halfSecondSignal() == start);
+    CHECK((sub.pendingInterrupts() & PC1600SubCpu::kIrqHalfSecond) != 0);
+    sub.strobe(0xA2);
+    CHECK((sub.readAnswer() & PC1600SubCpu::kIrqHalfSecond) != 0);
+    CHECK(sub.pendingInterrupts() == 0);
 }
 
 void test_runcycles_budget_is_tstates_in_either_bus_mode() {
@@ -396,38 +400,106 @@ void test_debug_bank_state_resolves_the_live_address_map() {
     CHECK(s.slotmapRedirect[2]);
 }
 
-// The ON/BREAK key must wake the SC7852 from a HALT that has no periodic
-// interrupt to end it -- the state the ROM's auto-power-off / OFF-key
-// power-down leaves it in (every port-35H cause masked, HALT with IFF1=1).
-// Only the 64 Hz / 0.5 s timers otherwise raise interrupts, both masked in
-// this state, so the ON key must be its own independent wake source.
-void test_on_key_wakes_a_halted_sc7852() {
-    PC1600Machine m;
+// The ROM's OFF sequence in miniature: the SC-7852 hands the bus to the
+// LH-5803 (OUT (38H) ; HALT), which sends the system-off command raw as
+// 15H (= ~EAH) and halts (rom1500 E527H-E553H).
+void loadOffSequence(PC1600Machine& m) {
     std::vector<uint8_t> lower = makeBank(0x00);
     std::vector<uint8_t> upper = makeBank(0x00);
-    lower[0] = 0x76; // HALT at reset -- stands in for the power-down park
+    lower[0] = 0xD3; lower[1] = 0x38; // OUT (38H),A
+    lower[2] = 0x76;                  // HALT
     CHECK(m.loadBank0(lower.data(), lower.size(), upper.data(), upper.size()));
+    std::vector<uint8_t> lh5803Rom(16384, 0x00);
+    const uint8_t off[] = {0xB5, 0x15,              // LDI A,15H
+                           0xFD, 0xAE, 0x00, 0x21,  // STA #(0021H)
+                           0xFD, 0xB1};             // HLT
+    for (size_t i = 0; i < sizeof off; i++) lh5803Rom[i] = off[i];
+    lh5803Rom[16384 - 2] = 0xC0;
+    lh5803Rom[16384 - 1] = 0x00;
+    CHECK(m.loadLH5803Rom(lh5803Rom.data(), lh5803Rom.size()));
     m.reset();
+}
 
-    m.step();
-    CHECK(m.sc7852().halted());
+bool runUntilOff(PC1600Machine& m) {
+    for (int i = 0; i < 1000 && !m.isPoweredOff(); i++) m.step();
+    return m.isPoweredOff();
+}
 
-    // No periodic interrupt is unmasked at reset, so it stays halted no
-    // matter how long runCycles() spins.
-    m.runCycles(5000);
-    CHECK(m.sc7852().halted());
+uint8_t subCpuPowerOnCause(PC1600Machine& m) {
+    m.memory().subCpu().strobe(0xA5); // IOCS 15H
+    return m.memory().subCpu().readAnswer();
+}
 
-    // Pressing ON raises the wake interrupt; the next step resumes it.
+// SubCpu doc §4: the system goes off once the sub-CPU has EAH and the CPU
+// side halts; the calendar clock keeps running; the ON key's rising edge
+// powers it on as a Z-80 reset that reports "ON key" (A5H bit 3).
+void test_off_command_switches_power_and_on_key_resets() {
+    PC1600Machine m;
+    loadOffSequence(m);
+    m.seedClock(2026, 9, 26, 10, 0, 0);
+    CHECK(runUntilOff(m));
+    CHECK(m.lh5803().halted());
+
+    m.runCycles(static_cast<uint64_t>(PC1600Machine::kTStateHz) * 3);
+    CHECK(m.isPoweredOff());
+    CHECK(PC1600SubCpu::unpackBcd(m.memory().subCpu().dateTime().second) == 3);
+
     m.setOnKeyPressed(true);
     m.step();
-    CHECK(!m.sc7852().halted());
-
-    // A second press with the key still held is not a fresh edge -- no
-    // extra interrupt (the CPU is already running; nothing to assert
-    // beyond "doesn't crash / re-halt").
+    CHECK(!m.isPoweredOff());
+    CHECK(m.sc7852Owns());
+    CHECK(m.sc7852().pc() == 0x0000);     // came up through reset
+    CHECK(subCpuPowerOnCause(m) == PC1600SubCpu::kCauseOnKey);
+    // Held key: no fresh edge, nothing more happens.
     m.setOnKeyPressed(true);
     m.step();
-    CHECK(!m.sc7852().halted());
+    CHECK(!m.isPoweredOff());
+}
+
+// The wake-up timer matches either way, but only switches the system on
+// when SWPON bit 1 allows it (WAKE$(0)).
+void test_wake_timer_powers_on_only_when_enabled() {
+    PC1600Machine m;
+    loadOffSequence(m);
+    auto& sub = m.memory().subCpu();
+    auto setWake = [&](uint8_t minuteLo) {
+        const uint8_t n[9] = {12, 2, 5, 0, 7, 3, minuteLo, 0, 0}; // 12/25 07:3x
+        for (int i = 0; i < 9; i++) sub.strobe(static_cast<uint8_t>((i ? 0x80 : 0xF0) | n[i]));
+        sub.strobe(0x94);                                         // SWWT
+    };
+    sub.setDateTime({12, 0x25, 0x07, 0x29, 0x58});
+    setWake(0);
+    CHECK(runUntilOff(m));
+    m.runCycles(static_cast<uint64_t>(PC1600Machine::kTStateHz) * 3);
+    CHECK(m.isPoweredOff());              // SWPON = 0: stays off...
+    CHECK((sub.pendingInterrupts() & PC1600SubCpu::kIrqWakeUp) != 0); // ...but it matched
+
+    sub.strobe(0xF2); sub.strobe(0xA4);   // SWPON = 2 (wake-up power-on)
+    setWake(1);
+    // Step until it comes on (this test program would switch it straight
+    // back off), then check it came on at 07:31:00.
+    for (uint64_t t = 0; m.isPoweredOff() && t < 62ull * PC1600Machine::kTStateHz;)
+        t += static_cast<uint64_t>(m.step());
+    CHECK(!m.isPoweredOff());
+    CHECK(sub.dateTime().minute == 0x31 && sub.dateTime().second == 0x00);
+    CHECK(subCpuPowerOnCause(m) == PC1600SubCpu::kCauseWakeUp);
+}
+
+// RS-232C CI switches the system on when SWPON bit 0 allows it (WAKE$(1)).
+void test_ci_powers_on_when_enabled() {
+    PC1600Machine m;
+    loadOffSequence(m);
+    auto& sub = m.memory().subCpu();
+    CHECK(runUntilOff(m));
+    sub.setCiLine(true);
+    m.step();
+    CHECK(m.isPoweredOff());              // SWPON = 0
+    sub.setCiLine(false);
+    sub.strobe(0xF1); sub.strobe(0xA4);   // SWPON = 1
+    sub.setCiLine(true);
+    m.step();
+    CHECK(!m.isPoweredOff());
+    CHECK(subCpuPowerOnCause(m) == PC1600SubCpu::kCauseCi);
 }
 
 // The ROM's handoff (P1-B3 5C0E-5C22): 35H = 08H, OUT (38H), EI, HALT.
@@ -463,33 +535,6 @@ void test_lh5803_handback_is_a_cause_bit3_interrupt() {
     CHECK((m.memory().readIO(0x32) & 0x08) == 0x08);
 }
 
-// An ON press that lands while the SC7852 is between OUT (38H) and HALT is
-// held until the LH5803 it hands to halts, then wakes that one.
-void test_on_press_before_handoff_halt_still_wakes() {
-    PC1600Machine m;
-    std::vector<uint8_t> lower = makeBank(0x00);
-    std::vector<uint8_t> upper = makeBank(0x00);
-    lower[0] = 0xD3; lower[1] = 0x38; // OUT (38H),A
-    lower[2] = 0x76;                  // HALT
-    CHECK(m.loadBank0(lower.data(), lower.size(), upper.data(), upper.size()));
-    std::vector<uint8_t> lh5803Rom(16384, 0x00);
-    lh5803Rom[0] = 0xFD; lh5803Rom[1] = 0xB1; // HLT
-    lh5803Rom[16384 - 2] = 0xC0;
-    lh5803Rom[16384 - 1] = 0x00;
-    CHECK(m.loadLH5803Rom(lh5803Rom.data(), lh5803Rom.size()));
-    m.reset();
-
-    m.step();                   // OUT (38H),A
-    m.setOnKeyPressed(true);    // SC7852 running: nothing to wake yet
-    m.step();                   // HALT -> bus to the LH5803
-    CHECK(!m.sc7852Owns());
-    m.step();                   // LH5803: HLT
-    CHECK(m.lh5803().halted());
-    m.step();                   // the held press wakes it
-    CHECK(!m.lh5803().halted());
-    CHECK(m.sc7852().halted()); // the parked SC7852 is left alone
-}
-
 // An ON press while the bus owner is running is a BREAK the ROM reads from
 // the 1BH latch -- it must not stay pending and later wake the machine out
 // of the next power-down park.
@@ -517,53 +562,9 @@ void test_on_press_while_running_does_not_wake_a_later_park() {
     CHECK(m.lh5803().halted());
     m.runCycles(5000);
     CHECK(m.lh5803().halted()); // still parked
+    CHECK(!m.isPoweredOff());   // a HALT alone is not a power-off
 }
 
-// Same wake requirement, but with the bus already handed to the LH5803:
-// the SC7852 issues its documented `OUT (38H),A` handoff before its own
-// power-down HALT, so the machine can be frozen with the LH5803 parked
-// instead of the SC7852. Waking only the SC7852 is not enough; the LH5803
-// is LH5801-family, whose ordinary requestMaskableInterrupt() is IE-gated
-// and does nothing to a HALT with IE clear (the reset-time default) --
-// wakeFromHalt() is the unconditional counterpart this needs.
-void test_on_key_wakes_a_halted_lh5803_owning_the_bus() {
-    PC1600Machine m;
-    std::vector<uint8_t> lower = makeBank(0x00);
-    std::vector<uint8_t> upper = makeBank(0x00);
-    lower[0] = 0xD3; lower[1] = 0x38; // OUT (38H),A
-    lower[2] = 0x76;                  // HALT -- completes the handoff to LH5803
-    CHECK(m.loadBank0(lower.data(), lower.size(), upper.data(), upper.size()));
-
-    // LH5803 ROM: HLT (0xFD 0xB1 -- the 0xFD-prefixed special-op encoding,
-    // matching lh5801_tests.cpp's own Rig) at its own reset vector
-    // (0xC000). IE is clear at reset, so this HLT cannot be woken by an
-    // ordinary maskable interrupt -- exactly the state a real power-down
-    // HALT is in.
-    std::vector<uint8_t> lh5803Rom(16384, 0x00);
-    lh5803Rom[0x0000] = 0xFD; lh5803Rom[0x0001] = 0xB1;
-    lh5803Rom[16384 - 2] = 0xC0;
-    lh5803Rom[16384 - 1] = 0x00;
-    CHECK(m.loadLH5803Rom(lh5803Rom.data(), lh5803Rom.size()));
-
-    m.reset();
-    m.step(); // OUT (38H),A
-    m.step(); // HALT -- switches bus ownership to LH5803
-    CHECK(!m.sc7852Owns());
-
-    m.step(); // LH5803 executes its own HLT at 0xC000
-    CHECK(m.lh5803().halted());
-
-    // No periodic interrupt reaches an LH5803 HLT, so it stays halted no
-    // matter how long runCycles() spins.
-    m.runCycles(5000);
-    CHECK(m.lh5803().halted());
-
-    // Pressing ON wakes it even though bus ownership never returned to the
-    // SC7852 and IE was never set.
-    m.setOnKeyPressed(true);
-    m.step();
-    CHECK(!m.lh5803().halted());
-}
 
 void test_rtc_advances_while_lh5803_owns_the_bus() {
     // The OFF-key / auto-power-off shutdown hands the bus to the LH5803 for
@@ -652,16 +653,28 @@ void test_int_line_follows_cause_and_mask() {
     CHECK(mem.readIO(0x32) == 0x10);
     CHECK(!m.sc7852().intLine()); // read-clear drops it
 
-    // A cause arriving while masked is still latched; unmasking raises INT.
+    // A cause arriving while masked at 35H is still there; unmasking raises
+    // INT. Bit 6 is the sub-CPU's Z7, a level its own mask (SWMSK) gates.
     mem.writeIO(0x35, 0x00);
-    mem.latchSubCpuInterruptCause();
+    mem.subCpu().strobe(0xF0); mem.subCpu().strobe(0x82); mem.subCpu().strobe(0xA0); // SWMSK 02H
+    mem.subCpu().halfSecondTick();
     CHECK(!m.sc7852().intLine());
     mem.writeIO(0x35, 0x40);
     CHECK(m.sc7852().intLine());
+    mem.subCpu().strobe(0xA2);                  // SRIRQ read drops Z7
+    CHECK(!m.sc7852().intLine());
 
     // Bit 0 is the TC8576F's live INT output, not a latch: a 32H read
     // leaves it (and INT) up until the chip itself is serviced.
+    // The transmit interrupt needs a peer's CTS and TxEN (CPC §6.5).
     mem.readIO(0x32);
+    struct CtsLink : SerialLink {
+        bool poll(uint8_t&) override { return false; }
+        void send(uint8_t) override {}
+    } link;
+    m.setSerialLink(&link);
+    mem.uart().tick(1);                         // pick up CTS
+    mem.writeIO(0x23, 0x01);                    // TxEN
     mem.writeIO(0x23, 0xC5);                    // pr[5] = 0: TxINTM clear
     mem.writeIO(0x22, 0x00);
     mem.writeIO(0x35, 0x01);
@@ -673,11 +686,12 @@ void test_int_line_follows_cause_and_mask() {
     mem.writeIO(0x22, 0x02);
     CHECK(!m.sc7852().intLine());
     CHECK((mem.readIO(0x32) & 0x01) == 0x00);
+    m.setSerialLink(nullptr);
 
     // Reset clears cause and mask, and the line with them.
     m.reset();
     CHECK(!m.sc7852().intLine());
-    CHECK((mem.readIO(0x32) & 0xFE) == 0x00); // bit 0: the reset chip's TxRDY, masked at 35H
+    CHECK(mem.readIO(0x32) == 0x00);
     CHECK(mem.intMask() == 0x00);
 }
 
@@ -718,7 +732,210 @@ void test_real_rom_off_stays_off_and_on_restarts() {
     }
 }
 
+// Real ROM: ON TIME$ GOSUB fires. BASIC stores the time with SWA1T (96H);
+// at the matching minute carry the sub-CPU raises SRIRQ bit 6, the INT6
+// handler sets F127H bit 6, and the interpreter branches (SubCpu §5).
+void typeProgram(PC1600Machine& m, std::initializer_list<const char*> lines) {
+    std::string err;
+    for (const char* l : lines) CHECK(typeLine(m, l, /*pressEnter=*/true, &err));
+}
+
+void test_rom_on_time_gosub_fires() {
+    PC1600Machine m;
+    if (!bootPC1600(m)) {
+        std::fprintf(stderr, "SKIP test_rom_on_time_gosub_fires: PC-1600 ROM images not found\n");
+        return;
+    }
+    tapKey(m, "mode"); // RUN -> PRO
+    waitIdle(m, PC1600Machine::kTStateHz);
+    typeProgram(m, {
+        "10 POKE &FF80,0",
+        "20 DATE$=\"09/26\":TIME$=\"13:29:57\"",
+        "30 ON TIME$=\"09/26/13/30\" GOSUB 100",
+        "40 TIME$ ON",
+        "50 GOTO 50",
+        "100 POKE &FF80,123",
+        "110 END",
+    });
+    tapKey(m, "mode"); // PRO -> RUN
+    waitIdle(m, PC1600Machine::kTStateHz);
+    std::string err;
+    typeLine(m, "RUN", /*pressEnter=*/true, &err);
+    // Step in 50 ms slices until the handler has run; it must be at the
+    // 13:30:00 minute carry, not before.
+    PC1600SubCpu::DateTime at{};
+    for (int i = 0; i < 200 && m.memory().read(0xFF80) != 123; i++) {
+        at = m.memory().subCpu().dateTime();
+        m.runCycles(PC1600Machine::kTStateHz / 20);
+    }
+    CHECK(m.memory().read(0xFF80) == 123);
+    CHECK(at.hour == 0x13 && at.minute == 0x30 && at.second == 0x00);
+}
+
+bool runUntil(PC1600Machine& m, bool wantOff, double seconds) {
+    const uint64_t limit = static_cast<uint64_t>(seconds * PC1600Machine::kTStateHz);
+    for (uint64_t t = 0; m.isPoweredOff() != wantOff && t < limit;) t += m.runCycles(PC1600Machine::kTStateHz / 100);
+    return m.isPoweredOff() == wantOff;
+}
+
+// Real ROM: the OFF key runs the ROM's power-off (signature at FA08H, EAH
+// from the LH-5803), the system goes off, and ON brings it back through a
+// reset that resumes -- program kept, prompt responsive (SubCpu §4.1).
+void test_rom_off_on_resumes() {
+    PC1600Machine m;
+    if (!bootPC1600(m)) {
+        std::fprintf(stderr, "SKIP test_rom_off_on_resumes: PC-1600 ROM images not found\n");
+        return;
+    }
+    tapKey(m, "mode"); // RUN -> PRO
+    waitIdle(m, PC1600Machine::kTStateHz);
+    typeProgram(m, {"10 PRINT 1"});
+    const uint16_t end = static_cast<uint16_t>((m.memory().read(0xF867) << 8) | m.memory().read(0xF868));
+    tapKey(m, "mode"); // PRO -> RUN
+    waitIdle(m, PC1600Machine::kTStateHz);
+
+    tapKey(m, "off");
+    CHECK(runUntil(m, /*wantOff=*/true, 3.0));
+    // The OFF key's power-off (P0-B0 0B07H) marks FA08H with AAH x 4.
+    for (int i = 0; i < 4; i++) CHECK(m.memory().read(static_cast<uint16_t>(0xFA08 + i)) == 0xAA);
+    m.runCycles(static_cast<uint64_t>(PC1600Machine::kTStateHz) * 2);
+    CHECK(m.isPoweredOff());
+
+    m.setOnKeyPressed(true);
+    m.runCycles(PC1600Machine::kTStateHz / 10);
+    m.setOnKeyPressed(false);
+    CHECK(!m.isPoweredOff());
+    // The boot waits for ON's release, then comes back to the prompt.
+    for (int k = 0; k < 30 && !(m.sc7852().halted() && m.sc7852().pc() == 0x92B3); k++)
+        m.runCycles(PC1600Machine::kTStateHz / 10);
+    waitIdle(m, static_cast<uint64_t>(PC1600Machine::kTStateHz) * 2);
+    const uint16_t endAfter = static_cast<uint16_t>((m.memory().read(0xF867) << 8) | m.memory().read(0xF868));
+    CHECK(endAfter == end);
+    std::string err;
+    CHECK(typeLine(m, "POKE &FF80,55", /*pressEnter=*/true, &err));
+    waitIdle(m, PC1600Machine::kTStateHz);
+    CHECK(m.memory().read(0xFF80) == 55);
+}
+
+// Real ROM: WAKE$(0) switches a POWER OFF machine on at the set minute and
+// runs its command string (FA1BH bit 6 -> FF00H to the key buffer). The
+// ROM separates the command with ':' (romIII-3 6E23H compares 3AH).
+void test_rom_wake_runs_command_at_the_set_time() {
+    PC1600Machine m;
+    if (!bootPC1600(m)) {
+        std::fprintf(stderr, "SKIP test_rom_wake_runs_command_at_the_set_time: PC-1600 ROM images not found\n");
+        return;
+    }
+    tapKey(m, "mode"); // RUN -> PRO -> RUN, as after any ALL RESET here
+    waitIdle(m, PC1600Machine::kTStateHz);
+    tapKey(m, "mode");
+    waitIdle(m, PC1600Machine::kTStateHz);
+    std::string err;
+    for (const char* l : {"TIME$=\"13:30:00\"", "DATE$=\"09/26\"", "POKE &FF80,0",
+                          "WAKE$(0)=\"09/26/13/31:POKE &FF80,77\"+CHR$(13)"}) {
+        CHECK(typeLine(m, l, /*pressEnter=*/true, &err));
+        waitIdle(m, PC1600Machine::kTStateHz);
+    }
+    const PC1600SubCpu::Alarm w = m.memory().subCpu().timer(PC1600SubCpu::WakeUp);
+    CHECK(w.month == 9 && w.day == 0x26 && w.hour == 0x13 && w.minute == 0x31);
+    CHECK(typeLine(m, "POWER OFF", /*pressEnter=*/true, &err));
+    CHECK(runUntil(m, /*wantOff=*/true, 3.0));
+    CHECK(runUntil(m, /*wantOff=*/false, 70.0));
+    const PC1600SubCpu::DateTime at = m.memory().subCpu().dateTime();
+    CHECK(at.minute == 0x31 && at.second == 0x00);
+    m.runCycles(static_cast<uint64_t>(PC1600Machine::kTStateHz) * 5);
+    CHECK(m.memory().read(0xFF80) == 77);
+}
+
+// Real ROM: auto power-off after 10 idle minutes (the INT6 handler's
+// countdown, P1-B3 426AH -> 0005H -> P0-B0 0B66H) saves SP at F0DAH and
+// marks FA08H with A5H x 4. ON then resumes through that signature, which
+// the resume path clears (P0-B0 07E6H/07FEH).
+void test_rom_auto_power_off_resumes() {
+    PC1600Machine m;
+    if (!bootPC1600(m)) {
+        std::fprintf(stderr, "SKIP test_rom_auto_power_off_resumes: PC-1600 ROM images not found\n");
+        return;
+    }
+    tapKey(m, "mode"); waitIdle(m, PC1600Machine::kTStateHz);
+    tapKey(m, "mode"); waitIdle(m, PC1600Machine::kTStateHz);
+    CHECK(runUntil(m, /*wantOff=*/true, 700.0));
+    CHECK(m.memory().subCpu().dateTime().minute == 0x10);
+    for (int i = 0; i < 4; i++) CHECK(m.memory().read(static_cast<uint16_t>(0xFA08 + i)) == 0xA5);
+
+    m.setOnKeyPressed(true);
+    m.runCycles(PC1600Machine::kTStateHz / 10);
+    m.setOnKeyPressed(false);
+    for (int k = 0; k < 30 && !(m.sc7852().halted() && m.sc7852().pc() == 0x92B3); k++)
+        m.runCycles(PC1600Machine::kTStateHz / 10);
+    CHECK(!m.isPoweredOff());
+    CHECK(m.memory().read(0xFA1B) == 0x10);  // power-on by the ON key
+    CHECK(m.memory().read(0xFA08) == 0x00);  // signature consumed: resumed
+    std::string err;
+    CHECK(typeLine(m, "POKE &FF80,55", /*pressEnter=*/true, &err));
+    waitIdle(m, PC1600Machine::kTStateHz);
+    CHECK(m.memory().read(0xFF80) == 55);
+}
+
+// Real ROM: a COM1: transfer through the TC8576F to an attached peer --
+// SETCOM, OPEN, PRINT#, CLOSE. Exercises the CPC as the ROM programs it:
+// PR7/PR1:PR0 baud, the serial command shadow (TxEN), and the CS/CD/DR
+// status polarity the ROM checks before it sends (PC-1600-CPC-TC8576.md §9).
+struct RecordingLink : SerialLink {
+    std::vector<uint8_t> tx;
+    std::deque<uint8_t> rx;
+    uint32_t baud = 0;
+    bool poll(uint8_t& out) override {
+        if (rx.empty()) return false;
+        out = rx.front(); rx.pop_front(); return true;
+    }
+    void send(uint8_t b) override { tx.push_back(b); }
+    void onBaud(uint32_t b, int) override { baud = b; }
+    Lines lines;
+    void getStatus(Lines& in) override { in = lines; }
+};
+
+void test_rom_com1_print_reaches_the_peer() {
+    PC1600Machine m;
+    if (!bootPC1600(m)) {
+        std::fprintf(stderr, "SKIP test_rom_com1_print_reaches_the_peer: PC-1600 ROM images not found\n");
+        return;
+    }
+    RecordingLink link;
+    m.setSerialLink(&link);
+    tapKey(m, "mode"); waitIdle(m, PC1600Machine::kTStateHz);
+    tapKey(m, "mode"); waitIdle(m, PC1600Machine::kTStateHz);
+    std::string err;
+    auto type = [&](const char* l) {
+        CHECK(typeLine(m, l, /*pressEnter=*/true, &err));
+        waitIdle(m, PC1600Machine::kTStateHz);
+    };
+    // SNDSTAT 24: send only while CS is on, 1 s timeout.
+    for (const char* l : {"MAXFILES=1", "SETCOM \"COM1:\",9600,8,N,1,N,N", "SNDSTAT \"COM1:\",24,2",
+                          "OPEN \"COM1:\" FOR OUTPUT AS #1", "PRINT #1,\"HELLO\"", "CLOSE #1"})
+        type(l);
+    m.runCycles(PC1600Machine::kTStateHz);
+    CHECK(link.baud == 9600);
+    CHECK(std::string(link.tx.begin(), link.tx.end()).find("HELLO") != std::string::npos);
+
+    // CS off: the ROM holds the data back (P2-B6 A524H gating) and times out.
+    link.lines.cts = false;
+    link.tx.clear();
+    for (const char* l : {"OPEN \"COM1:\" FOR OUTPUT AS #1", "PRINT #1,\"WORLD\"", "CLOSE #1"}) type(l);
+    m.runCycles(static_cast<uint64_t>(PC1600Machine::kTStateHz) * 2);
+    CHECK(std::string(link.tx.begin(), link.tx.end()).find("WORLD") == std::string::npos);
+    m.setSerialLink(nullptr);
+}
+
 int run_pc1600_machine_tests() {
+    test_rom_com1_print_reaches_the_peer();
+    test_rom_auto_power_off_resumes();
+    test_rom_off_on_resumes();
+    test_rom_wake_runs_command_at_the_set_time();
+    test_off_command_switches_power_and_on_key_resets();
+    test_wake_timer_powers_on_only_when_enabled();
+    test_ci_powers_on_when_enabled();
+    test_rom_on_time_gosub_fires();
     test_simple_reset_keeps_internal_ram_all_reset_wipes_it();
     test_reset_releases_held_keys();
     test_reset_level_reported_to_boot_rom_via_request_5A();
@@ -734,15 +951,12 @@ int run_pc1600_machine_tests() {
     test_trace_rings_are_independent_and_cpu_id_tagged();
     test_runcycles_charges_halted_steps_at_the_halt_tick_rate();
     test_yield_hook_fires_per_interval_across_runcycles_calls();
-    test_half_second_signal_toggles_off_the_05s_accumulator();
+    test_half_second_tick_raises_srirq_bit1();
     test_runcycles_budget_is_tstates_in_either_bus_mode();
-    test_on_key_wakes_a_halted_sc7852();
     test_int_line_follows_cause_and_mask();
     test_lh5803_handback_is_a_cause_bit3_interrupt();
-    test_on_press_before_handoff_halt_still_wakes();
     test_on_press_while_running_does_not_wake_a_later_park();
     test_real_rom_off_stays_off_and_on_restarts();
-    test_on_key_wakes_a_halted_lh5803_owning_the_bus();
     test_rtc_advances_while_lh5803_owns_the_bus();
     test_seed_clock_millisecond_aligns_next_tick();
 

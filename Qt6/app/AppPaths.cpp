@@ -1,5 +1,7 @@
 #include "AppPaths.hpp"
 #include "AppSettings.hpp"
+#include "Connector/FloppyImageFile.hpp"
+#include "Connector/MemoryCardCatalog.hpp"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -25,27 +27,36 @@ QString bundledResourcesDir() {
 #endif
 }
 
-QString defaultInstanceDir() {
-    const QString dir = QDir::homePath() + QStringLiteral("/Calc-U-1600");
-    QDir().mkpath(dir);
-    return dir;
-}
-
 namespace {
 QString& isolatedInstanceDir() {
     static QString dir;
     return dir;
 }
+
+// `path` with the leading `dir` replaced by `shown`, or empty when `path`
+// isn't `dir` itself or inside it.
+QString replacePrefix(const QString& path, const QString& dir, const QString& shown) {
+    if (dir.isEmpty() || !path.startsWith(dir)) return QString();
+    if (path.size() > dir.size() && path.at(dir.size()) != QLatin1Char('/')) return QString();
+    return shown + path.mid(dir.size());
+}
 } // namespace
+
+QString defaultInstanceDir() {
+    const QString dir = isolatedInstanceDir().isEmpty() ? QDir::homePath() + QStringLiteral("/Calc-U-1600")
+                                                        : isolatedInstanceDir();
+    QDir().mkpath(dir);
+    return dir;
+}
 
 void setIsolatedInstanceDir(const QString& dir) {
     isolatedInstanceDir() = dir;
 }
 
-QString forDisplay(const QString& path) {
-    const QString isolated = isolatedInstanceDir();
-    if (isolated.isEmpty() || !path.startsWith(isolated)) return path;
-    return defaultInstanceDir() + path.mid(isolated.size());
+QString displayPath(const QString& path) {
+    QString shown = replacePrefix(path, defaultInstanceDir(), QStringLiteral("~/Calc-U-1600"));
+    if (shown.isEmpty()) shown = replacePrefix(path, QDir::homePath(), QStringLiteral("~"));
+    return shown.isEmpty() ? path : shown;
 }
 
 QString instanceDir() {
@@ -54,19 +65,11 @@ QString instanceDir() {
         QDir().mkpath(override);
         return override;
     }
-    if (!isolatedInstanceDir().isEmpty()) {
-        QDir().mkpath(isolatedInstanceDir());
-        return isolatedInstanceDir();
-    }
     return defaultInstanceDir();
 }
 
 QString sanitizedInstanceFileName(const QString& instanceName) {
-    QString s = instanceName;
-    s.replace('/', '-').replace(':', '-');
-    s = s.simplified();  // trims + collapses internal whitespace runs
-    if (s.isEmpty()) s = QStringLiteral("Untitled");
-    return s + QStringLiteral(".card.yaml");
+    return QString::fromStdString(namedFileName(instanceName.toStdString(), kCardFileSuffix));
 }
 
 QString instancePathFor(const QString& instanceName) {
@@ -74,11 +77,7 @@ QString instancePathFor(const QString& instanceName) {
 }
 
 QString sanitizedFloppyFileName(const QString& diskName) {
-    QString s = diskName;
-    s.replace('/', '-').replace(':', '-');
-    s = s.simplified();
-    if (s.isEmpty()) s = QStringLiteral("Untitled");
-    return s + QStringLiteral(".floppy.yaml");
+    return QString::fromStdString(namedFileName(diskName.toStdString(), kFloppyFileSuffix));
 }
 
 QString floppyInstancePathFor(const QString& diskName) {

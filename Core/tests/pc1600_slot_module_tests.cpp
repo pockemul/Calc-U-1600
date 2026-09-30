@@ -139,6 +139,7 @@ void test_poke_memory_uses_the_host_path_and_verifies() {
         CHECK(m.pokeMemory(0x8100, bytes, 2));
         CHECK(m.memory().read(0x8100) == 0x12);
         CHECK(m.memory().read(0x8101) == 0x34);
+        CHECK(m.memory().poke(0x8102, 0x56)); // poke() itself reports the byte stored
     }
     {
         PC1600Machine m;
@@ -151,12 +152,14 @@ void test_poke_memory_uses_the_host_path_and_verifies() {
         CHECK(!m.pokeMemory(0x8100, bytes, 2));
         CHECK(m.memory().read(0x8100) == 0x5A);
         CHECK(m.memory().read(0x8101) == 0x5A);
+        CHECK(!m.memory().poke(0x8100, 0x12)); // claimed by the card, but not stored
     }
     {
         // Partly writable: the range crosses from internal RAM (FFFF) into
         // ROM (0000) -- rejected up front, the RAM byte left alone.
         PC1600Machine m;
-        m.memory().poke(0xFFFF, 0x77);
+        CHECK(m.memory().poke(0xFFFF, 0x77));
+        CHECK(!m.memory().poke(0x0000, 0x77)); // ROM
         const uint8_t bytes[] = {0x12, 0x34};
         CHECK(!m.pokeMemory(0xFFFF, bytes, 2));
         CHECK(m.memory().read(0xFFFF) == 0x77);
@@ -242,7 +245,7 @@ void test_ce155_contributes_full_8k_to_mem() {
 }
 
 // The CE-1638 plugged into a PC-1600 Slot 1: the same definition the
-// PC-1500 `memory-expansion:` path builds, wired in pin-for-pin. Its pin-4 chip select covers &8000-&BFFF here (not a
+// PC-1500 `slot-1:` path builds, wired in pin-for-pin. Its pin-4 chip select covers &8000-&BFFF here (not a
 // PC-1500's &0000-&3FFF Y0), so the card's banked-window index is masked to
 // the 16KB bank size -- &8000 and &BFFF must land at opposite ends of one
 // bank, not alias. Bank switching is the pin-18 write strobe (PC-1600 Slot

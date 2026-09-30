@@ -2,11 +2,13 @@
 
 #include <cctype>
 #include <sstream>
-#include <vector>
 
+#include "../Basic/BasicLineStoreCheck.hpp"
+#include "../Utf8.hpp"
 #include "PC1600Display.hpp"
 #include "PC1600Keyboard.hpp"
 #include "PC1600Machine.hpp"
+#include "PC1600ProgramPlacement.hpp"
 #include "PC1600StatusLine.hpp"
 #include "PC1600TypedInput.hpp"
 
@@ -29,6 +31,14 @@ constexpr int kIdleFrames = 4;
 // to notice and latch it, then tap the base key (which consumes the
 // latch). ~100 ms, the gap interactive shifted keys have always used.
 constexpr int kShiftGapFrames = 6;
+
+// Characters in a UTF-8 line (what the editor sees: one per character).
+int codePointCount(const std::string& line) {
+    int n = 0;
+    for (char c : line)
+        if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) n++;
+    return n;
+}
 
 // Settle after a line's ENTER, from typeLine() -- a short interval (poll
 // BUSY briefly in case a `type:` line ran real BASIC, then a fixed floor).
@@ -53,21 +63,51 @@ uint16_t readBE16(PC1600Machine& machine, uint16_t addr) {
     return static_cast<uint16_t>((hi << 8) | lo);
 }
 
-// BASPRG_END plus the program bytes BASPRG_ST..BASPRG_END, as the SC-7852
-// sees them. F865/F867 hold LH5803-side addresses; the LH5803's
-// $0000-$7FFF aliases the SC-7852's $8000-$FFFF (same mapping as
-// pc1600_cli --dump-basic). A line that replaces one of the same
-// tokenised length leaves BASPRG_END put but changes these bytes.
-std::vector<uint8_t> programSnapshot(PC1600Machine& machine) {
-    constexpr uint16_t kProgramStartPtr = 0xF865;
-    auto toZ80 = [](uint16_t a) -> uint32_t { return a < 0x8000 ? a + 0x8000u : a; };
-    const uint16_t endPtr = readBE16(machine, kProgramEndPtr);
-    const uint32_t st = toZ80(readBE16(machine, kProgramStartPtr));
-    const uint32_t end = toZ80(endPtr);
-    std::vector<uint8_t> snap{static_cast<uint8_t>(endPtr >> 8), static_cast<uint8_t>(endPtr)};
-    for (uint32_t a = st; a < end && a <= 0xFFFF; a++)
-        snap.push_back(machine.memory().peek(static_cast<uint16_t>(a)));
-    return snap;
+// F865/F867 (BASPRG_ST/BASPRG_END) hold LH5803-side addresses; the
+// LH5803's $0000-$7FFF aliases the SC-7852's $8000-$FFFF (same mapping as
+// pc1600_cli --dump-basic).
+constexpr uint16_t kProgramStartPtr = 0xF865;
+
+uint8_t peekZ80(PC1600Machine& machine, uint32_t a) {
+    return machine.memory().peek(static_cast<uint16_t>(a));
+}
+
+// The selected program area (TITLE): S0 keeps its start / end in
+// F865 / F867 (bank F02CH), an S1 / S2 program module in its slot
+// descriptor (Work-Area-Map §4.5: +4..+6 start, +7..+9 end, Z-80 address
+// low byte first + ADTBL index). The end "key" folds the bank index in, so
+// a line that moves the end into another bank still counts as a change.
+struct ProgramArea {
+    uint32_t start = 0;   // Z-80 address of the first line
+    uint32_t end = 0;     // Z-80 address of the end mark
+    uint32_t endKey = 0;  // end address + bank index, for change detection
+};
+
+ProgramArea programArea(PC1600Machine& machine) {
+    ProgramArea a;
+    const int title = machine.programAreaTitle();
+    if (title == 1 || title == 2) {
+        const pc1600::SlotDescriptor d =
+            pc1600::readSlotDescriptor([&](uint16_t at) { return machine.memory().peek(at); }, title);
+        a.start = d.start;
+        a.end = d.end;
+        a.endKey = a.end | (static_cast<uint32_t>(d.endIndex) << 16);
+    } else {
+        a.start = pc1600::lh5803ToZ80(readBE16(machine, kProgramStartPtr));
+        a.end = pc1600::lh5803ToZ80(readBE16(machine, kProgramEndPtr));
+        a.endKey = a.end | (static_cast<uint32_t>(machine.memory().peek(0xF02C)) << 16);
+    }
+    return a;
+}
+
+basic::LineStoreCheck captureProgram(PC1600Machine& machine, const std::string& line) {
+    const ProgramArea area = programArea(machine);
+    return basic::LineStoreCheck::capture([&](uint32_t a) { return peekZ80(machine, a); }, area.start, area.end, line,
+                                          area.endKey);
+}
+
+bool programChanged(PC1600Machine& machine, const basic::LineStoreCheck& check) {
+    return check.changed([&](uint32_t a) { return peekZ80(machine, a); }, programArea(machine).endKey);
 }
 
 // Run frames until the program-end pointer has held the same value for a
@@ -81,10 +121,10 @@ void settleUntilProgramPtrStable(PC1600Machine& machine) {
 
     uint64_t spent = 0;
     int stable = 0;
-    uint16_t last = readBE16(machine, kProgramEndPtr);
+    uint32_t last = programArea(machine).endKey;
     while (stable < kStableFramesNeeded && spent < kCap) {
         spent += machine.runCycles(kFrameTStates);
-        uint16_t now = readBE16(machine, kProgramEndPtr);
+        uint32_t now = programArea(machine).endKey;
         if (now == last) stable++;
         else { stable = 0; last = now; }
     }
@@ -193,12 +233,26 @@ bool typeLine(PC1600Machine& machine, const std::string& line, bool pressEnter, 
     // of this line would otherwise land unseen. No-op without a plotter.
     waitForKeyboardScanLoop(machine);
 
-    for (char c : line) {
+    for (std::size_t i = 0; i < line.size();) {
+        const std::size_t at = i;
+        char32_t cp = 0;
+        const bool decoded = decodeUtf8(line, i, cp);
         std::string name;
         bool needsShift = false;
-        if (!pc1600ResolveTypedChar(c, &name, &needsShift)) {
-            if (error) *error = "no PC-1600 key for character '" + std::string(1, c) + "'";
+        const bool kbii = decoded && cp >= 0x80;
+        const bool resolved = decoded && (kbii ? pc1600ResolveKbiiChar(cp, &name, &needsShift)
+                                               : pc1600ResolveTypedChar(static_cast<char>(cp), &name, &needsShift));
+        if (!resolved) {
+            if (error) *error = "no PC-1600 key for character '" + line.substr(at, i - at) + "'";
             return false;
+        }
+        if (kbii) {
+            // Shaped by what the user has latched (kbiiSequence, KeyPaste.hpp).
+            for (const KbiiTap& tap : kbiiSequence(name, needsShift, pc1600ReadLatches(machine))) {
+                tapKey(machine, tap.key);
+                if (tap.gapAfter) machine.runCycles(kFrameTStates * kShiftGapFrames);
+            }
+            continue;
         }
         if (needsShift) {
             // SHIFT tapped (not held) immediately before the base key; the
@@ -234,12 +288,12 @@ BasicTypeResult typeBasicProgramText(PC1600Machine& machine, const std::string& 
 
         // An over-length line would be truncated by the editor and stored
         // wrong -- reject it up front rather than type a mangled line.
-        if (static_cast<int>(line.size()) > kMaxBasicLineLength) {
+        if (codePointCount(line) > kMaxBasicLineLength) {
             result.rejectedLines.push_back(line);
             continue;
         }
 
-        const std::vector<uint8_t> before = programSnapshot(machine);
+        const basic::LineStoreCheck before = captureProgram(machine, line);
 
         std::string typeError;
         if (!typeLine(machine, line, /*pressEnter=*/true, &typeError)) {
@@ -251,13 +305,13 @@ BasicTypeResult typeBasicProgramText(PC1600Machine& machine, const std::string& 
         // Wait for the editor to finish linking the line, then check it
         // actually landed: a stored line moves F867 (BASPRG_END,
         // big-endian) or, replacing a line of the same tokenised length,
-        // rewrites the program bytes. A line that changed neither was not
+        // rewrites that line's record. A line that changed neither was not
         // stored -- almost always because the machine isn't in PRO mode (a
         // preset must `key: mode` into it before the program: block).
         // Re-typing a line identical to the stored one also changes
         // nothing and is reported the same way.
         settleUntilProgramPtrStable(machine);
-        if (programSnapshot(machine) != before) storedCount++;
+        if (programChanged(machine, before)) storedCount++;
         else result.rejectedLines.push_back(line);
     }
 

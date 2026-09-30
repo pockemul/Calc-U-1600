@@ -9,6 +9,7 @@
 #include "../Audio/PiezoSampler.hpp"
 #include "../CPU/SC7852/SC7852.hpp"
 #include "../Connector/ExpansionCard.hpp"
+#include "../Connector/CardChain.hpp"
 #include "../Connector/MemorySlotConnector.hpp"
 #include "../Connector/PC1600SystemBus.hpp"
 #include "PC1600Bank.hpp"
@@ -22,7 +23,7 @@
 //
 // Resolves each of the SC7852's four 16KB pages against a PC1600Bank's
 // current register state, per the "Memory Map by Bank" table in
-// SharpPC1500Reference/PC-1600/PC-1600-Memory-Bank-Switching.md.
+// Sharp1500-1600-Ref/PC-1600/PC-1600-Memory-Bank-Switching.md.
 //
 // Pages (Z-80 address space):
 //   Page A  0000-3FFF  system ROM, CS001 — always resident, regardless of
@@ -144,16 +145,7 @@ public:
     /// dispatch used its unrelated, never-written default, so any genuine
     /// interrupt would have vectored through garbage. Defaults to nullptr,
     /// same no-op-when-unset convention as setBusArbiter().
-    void setCPU(SC7852* cpu) {
-        m_cpu = cpu;
-        // The TC8576F's INT output (a level, masked per source by its own
-        // pr[5]) reaches the SC-7852 on INT0 = interrupt-cause bit 0. It is
-        // not latched: bit 0 follows the chip until the handler services
-        // the chip (e.g. reads RxD). Port 35H bit 0 gates it in
-        // updateIntLine().
-        m_uart.setInterruptHook([this](bool) { updateIntLine(); });
-        updateIntLine();
-    }
+    void setCPU(SC7852* cpu) { m_cpu = cpu; }
 
     /// Raw port 35H value -- debug/test access, same convention as
     /// PC1500Machine's own cpu()/memory() unlocked accessors.
@@ -251,31 +243,36 @@ public:
     /// this project's own trace evidence can distinguish from "write
     /// clears" or "cleared some other way," and is the simplest
     /// convention consistent with it.
-    void latchTimer64InterruptCause() { m_intCause |= 0x10; updateIntLine(); }
+    void latchTimer64InterruptCause() { m_intCause |= 0x10; }
 
-
-    /// Latches interrupt-cause register (port 32H) bit 6, the sub-CPU's
-    /// aggregated interrupt line. Same falling-edge-only, read-clears
-    /// convention as latchTimer64InterruptCause() above.
-    void latchSubCpuInterruptCause() { m_intCause |= 0x40; updateIntLine(); }
 
     /// Latches cause bit 3, "interrupt from the LH-5801/5803 side": the
     /// LH5803's STA #(0A038H) handback. The ROM's only handoff (P1-B3
     /// 5C0E-5C22) unmasks just this cause (35H = 08H) before EI;HALT, and
     /// the dispatcher's bit-3 branch (4154H) acknowledges it -- so this
     /// INT is what ends the parked SC7852's HALT.
-    void latchLh5803InterruptCause() { m_intCause |= 0x08; updateIntLine(); }
+    void latchLh5803InterruptCause() { m_intCause |= 0x08; }
 
-    /// Port 32H as read: the latched causes plus bit 0, the TC8576F's live
-    /// INT output (TC8576F -> INT0, pin 81).
+    /// Port 32H as read: the latched causes plus two live levels, bit 0
+    /// the TC8576F's INT output (INT0, pin 81) and bit 6 the sub-CPU's Z7
+    /// (INT6, pin 84). Neither is latched: bit 0 follows the chip until the
+    /// handler services it (e.g. reads RxD), bit 6 drops when the handler
+    /// reads SRIRQ (PC1600SubCpu).
     uint8_t intCause() const {
-        return static_cast<uint8_t>(m_intCause | (m_uart.interruptOutput() ? 0x01 : 0x00));
+        return static_cast<uint8_t>(m_intCause | (m_uart.interruptOutput() ? 0x01 : 0x00) |
+                                    (m_subCpu.interruptRequest() ? 0x40 : 0x00));
     }
 
-    /// The SC-7852's INT line is the OR of the latched causes (port 32H)
-    /// that are enabled at port 35H -- a level, so masking a cause or the
-    /// 32H read that clears it withdraws a request not yet taken.
-    void updateIntLine() { if (m_cpu) m_cpu->setIntLine((intCause() & m_intMask) != 0); }
+    /// The SC-7852's INT line is the OR of the causes (port 32H) that are
+    /// enabled at port 35H -- a level, so masking a cause or the 32H read
+    /// that clears it withdraws a request not yet taken. The CPU asks for
+    /// it at the start of each step(); a masked live source isn't even
+    /// evaluated.
+    bool interruptLevel() const override {
+        return (m_intCause & m_intMask) != 0 ||
+               ((m_intMask & 0x01) && m_uart.interruptOutput()) ||
+               ((m_intMask & 0x40) && m_subCpu.interruptRequest());
+    }
 
     /// Loads the always-resident system ROM: `lower` backs page A
     /// (0000-3FFF, PC1600-P0-B0-new.bin) and `upper` backs page B bank 0
@@ -291,11 +288,20 @@ public:
     /// Page C bank 6 (PC1600-P2-B6-new.bin, display/timer/serial/char tables).
     bool loadBank6Rom(const uint8_t* data, size_t size);
 
-    /// The 60-pin system bus (Page B banks 4/5 ROM window + I/O ports
-    /// 0x80-0x8F) -- CE-1600P plugs in here, not the two memory slots. See
+    /// The 60-pin system bus (Page B banks 4-7 ROM window + I/O ports
+    /// 0x70-0x9F) -- CE-1600P and the host drive plug in here, not the memory slots. See
     /// PC1600SystemBus.hpp for why this bus has its own pin model rather
     /// than reusing ExpansionCard::PinState.
     PC1600SystemBus& ce1600pBus() { return m_ce1600pBus; }
+
+    /// The same 60-pin connector as seen from the LH5803 side: the cards
+    /// the LH5803 reaches (CE-150, CE-158). LH5803SharedMemory builds the
+    /// pins and offers its peripheral accesses here; the cards decode them.
+    /// This and ce1600pBus() are still two paths for one physical plug --
+    /// merging them waits on the open 60-pin signal questions (TODO.md,
+    /// "Expansion connectors: one model on both machines").
+    CardChain<ExpansionCard, PinState>& lh5803PeripheralBus() { return m_lh5803PeripheralBus; }
+    const CardChain<ExpansionCard, PinState>& lh5803PeripheralBus() const { return m_lh5803PeripheralBus; }
 
     /// Plugs a card into Slot 1 / Slot 2 -- the connector-level path, taking
     /// ownership of the card (mirrors PC1500Machine::attachExpansionCard).
@@ -343,6 +349,16 @@ public:
     std::vector<uint8_t> slot2CardImage() const {
         auto* c = m_slot2Conn.attachedCard();
         return c ? c->debugImage() : std::vector<uint8_t>{};
+    }
+
+    /// The Slot 1 / Slot 2 card's contentRevision(); 0 for an empty slot.
+    uint64_t slot1CardRevision() const {
+        auto* c = m_slot1Conn.attachedCard();
+        return c ? c->contentRevision() : 0;
+    }
+    uint64_t slot2CardRevision() const {
+        auto* c = m_slot2Conn.attachedCard();
+        return c ? c->contentRevision() : 0;
     }
 
     /// Copy the fixed internal 16 KB RAM (page D bank 0) into `out` (which
@@ -413,9 +429,11 @@ public:
     // Debug/test access, identical semantics to read()/write() — kept as a
     // separate name for symmetry with PC1500Memory's peek()/poke() and to
     // make call sites' intent explicit. poke() takes the host/debug path
-    // (PinState::direct) into a lock-gating card.
+    // (PinState::direct) into a lock-gating card, and returns whether the
+    // byte was stored (false: ROM, open bus, or a card that claimed the
+    // write but dropped it).
     uint8_t peek(uint16_t addr) const { return read(addr); }
-    void    poke(uint16_t addr, uint8_t value) { writeImpl(addr, value, /*direct=*/true); }
+    bool    poke(uint16_t addr, uint8_t value) { return writeImpl(addr, value, /*direct=*/true); }
 
     // SC7852Bus
     uint8_t readMem(uint16_t addr) override { return read(addr); }
@@ -439,14 +457,15 @@ private:
     MemorySlotConnector m_slot2Conn;
     std::unique_ptr<ExpansionCard> m_slot1Card; // null = slot empty
     std::unique_ptr<ExpansionCard> m_slot2Card;
-    PC1600SystemBus m_ce1600pBus; // Page B banks 4/5 + I/O 0x80-0x8F; see ce1600pBus()
+    PC1600SystemBus m_ce1600pBus; // Page B banks 4-7 + I/O 0x70-0x9F; see ce1600pBus()
+    CardChain<ExpansionCard, PinState> m_lh5803PeripheralBus; // see lh5803PeripheralBus()
     PC1600BusArbiter* m_arbiter{nullptr};
     SC7852* m_cpu{nullptr};
     uint8_t m_intCause{0};      // Port 32H latched causes, whatever the mask -- bit 3 LH5803
-                                // handback, bit 4 1/64 s timer, bit 6 sub-CPU; the rest have no
+                                // handback, bit 4 1/64 s timer; the rest have no
                                 // source yet. Read-clears.
-                                // Bit 0 (comm) is the UART's live level, see intCause().
-                                // INT = intCause() & mask (updateIntLine())
+                                // Bits 0 (comm) and 6 (sub-CPU) are live levels, see intCause().
+                                // INT = intCause() & mask (interruptLevel())
     uint8_t m_intMask{0};       // Port 35H
     uint8_t m_im2VectorLow{0xFF}; // Port 39H
 
@@ -613,5 +632,6 @@ private:
 
     // Shared body of write()/poke(): internal RAM first, then the two slot
     // connectors (`direct` distinguishes a host poke from a guest store).
-    void writeImpl(uint16_t addr, uint8_t value, bool direct);
+    // Returns whether the byte was stored.
+    bool writeImpl(uint16_t addr, uint8_t value, bool direct);
 };

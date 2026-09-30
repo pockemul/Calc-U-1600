@@ -78,13 +78,18 @@ public:
     // is always refused (the bundled disk would shadow the saved one).
     bool nameAndSave(const QString& diskName, QString* error);
 
-    // Preset `saveas:floppy:<name>` (PresetController's PresetSaveAsFn
-    // callback). Like nameAndSave(), the drive is then retargeted at the new
-    // instance (shown under that name, autosaving there), but unlike it:
-    // works even when the drive's disk is already saved (a "save as" -- the
-    // previous instance file just stops being autosaved), and silently
-    // overwrites an existing instance file of the same name. A bundled name is still refused.
-    bool saveAsFromPreset(const QString& diskName, QString* error);
+    // Preset `saveas: template|live floppy:<name>` (PresetController's
+    // PresetSaveAsFn callback). Like nameAndSave(), the drive is then
+    // retargeted at the saved file (shown under that name; a live save
+    // autosaves there, a template doesn't), but unlike it: works even when
+    // the drive's disk is already saved (a "save as" -- the previous
+    // instance file just stops being autosaved), and silently overwrites an
+    // existing file of the same name. A by-name save refuses a bundled name;
+    // a live one also refuses the name of a user template and never
+    // overwrites a template file, a template one may replace a user template.
+    // `filePath` (the `file:` form) writes exactly that file, with no name
+    // checks; empty = the instance directory.
+    bool saveAsFromPreset(const QString& diskName, const QString& filePath, bool asTemplate, QString* error);
 
     void markDirtyAndSchedulePersist();  // called once per frame tick
     void flushPendingPersist();          // called before select/model-switch/quit
@@ -95,10 +100,11 @@ signals:
 private:
     // Shared body of nameAndSave()/saveAsFromPreset(); `fromPreset` skips
     // the already-saved and name-collision checks.
-    bool saveDiskAs(const QString& diskName, bool fromPreset, QString* error);
+    bool saveDiskAs(const QString& diskName, bool fromPreset, QString* error, const QString& filePath = QString(),
+                    bool asTemplate = false);
     bool nameCollides(const QString& diskName) const;
-    // Every template disk's name (bundled or in the storage folder).
-    QVector<DiskEntry> templateEntries() const;
+    // A template disk in the storage folder (bundled ones aside).
+    bool isUserTemplateName(const QString& diskName) const;
     // Records the file the disk came from: a template is never written, an
     // instance autosaves in place (never into the bundle).
     void classifySource(const QString& resolvedPathOrEmpty, bool isTemplate);

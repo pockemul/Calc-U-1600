@@ -14,8 +14,8 @@ class PC1600Machine;
 // $8000-$BFFF window. `addr` is the Z-80 (SC7852) address -- no +$8000
 // conversion. The bytes go straight into the backing store
 // (debugWriteInternalRam / debugWriteSlotImage), so the current bank
-// state doesn't matter. Shared by the preset loader's `format: binary`
-// and the GUI's "Load Machine Code…". Returns false, writing nothing, with
+// state doesn't matter. Shared by the preset loader's machine-code
+// `program: file:` and the GUI's "Load Machine Code…". Returns false, writing nothing, with
 // `error` set (no "section N:" prefix -- the caller adds its own context).
 bool loadPC1600MachineCode(PC1600Machine& machine, int slot, uint32_t addr, const uint8_t* data, size_t len,
                            std::string* error);
@@ -29,3 +29,8 @@ pc1600::SlotGeometry pc1600SlotGeometry(PC1600Machine& machine, int slot);
 // from the work area (S0MTb / ADTBL / BASPRG_ST) via the placement logic;
 // empty if that can't be read (e.g. a machine that hasn't booted).
 std::vector<machinecode::BasicArea> pc1600BasicAreas(PC1600Machine& machine);
+
+// What the machine-code placement rules read (machinecode::PC1600State):
+// MODE, TITLE, the S0 areas, and for TITLE S1/S2 that module's window base
+// and program start from its slot descriptor.
+machinecode::PC1600State pc1600LoadState(PC1600Machine& machine);

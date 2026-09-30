@@ -34,6 +34,7 @@ int g_fail = 0;
 std::string tapsAsText(const std::vector<PasteStep>& steps) {
     std::string out;
     for (const PasteStep& s : steps) {
+        if (s.needsKbii) out += "~";
         if (s.needsShift) out += "^";
         out += s.key == "space" ? std::string("_") : s.key;
         out += ' ';
@@ -45,6 +46,32 @@ void test_build_steps_shift_and_skip() {
     // Lowercase + '"' + ':' + '#' need SHIFT; tab and a UTF-8 'é' are skipped.
     const std::vector<PasteStep> steps = buildPasteSteps("aB\"\t:#\xC3\xA9 1", pc1600ResolveTypedChar);
     CHECK(tapsAsText(steps) == "^A B ^f2 ^* ^f3 _ 1 ");
+}
+
+void test_build_steps_kbii_case_exact() {
+    // é/É: SHIFT+KBII S / KBII S. Ë has no uppercase in the ROM -> ë (W).
+    // û only exists as SHIFT+KBII. ß has no key and is skipped.
+    const std::string text = "m\xC3\xA9rci \xC3\x89\xC3\x8B\xC3\xAB\xC3\xBB\xC3\x9B\xC3\x9F";
+    CHECK(tapsAsText(buildPasteSteps(text, pc1600ResolveTypedChar, pc1600ResolveKbiiChar)) ==
+          "^M ~^S ^R ^C ^I _ ~S ~W ~W ~^B ~^B ");
+    // Without a KBII resolver (the PC-1500) non-ASCII is skipped.
+    CHECK(tapsAsText(buildPasteSteps(text, pc1500ResolveTypedChar)) == "^M ^R ^C ^I _ ");
+    // A malformed byte is skipped, the rest still typed.
+    CHECK(tapsAsText(buildPasteSteps("A\xC3" "B\xFF", pc1600ResolveTypedChar, pc1600ResolveKbiiChar)) == "A B ");
+}
+
+void test_kbii_resolver() {
+    // One rule everywhere: the character as typed; an uppercase the ROM
+    // lacks falls back to its lowercase.
+    std::string key;
+    bool shift = true;
+    CHECK(pc1600ResolveKbiiChar(U'ö', &key, &shift) && key == "R" && shift);   // ö
+    CHECK(pc1600ResolveKbiiChar(U'Ö', &key, &shift) && key == "R" && !shift);  // Ö
+    CHECK(pc1600ResolveKbiiChar(U'ë', &key, &shift) && key == "W" && !shift);  // ë
+    CHECK(pc1600ResolveKbiiChar(U'Ë', &key, &shift) && key == "W" && !shift);  // Ë
+    CHECK(pc1600ResolveKbiiChar(U'Û', &key, &shift) && key == "B" && shift);   // Û -> û
+    CHECK(pc1600ResolveKbiiChar(U'«', &key, &shift) && key == "(" && shift);   // «
+    CHECK(!pc1600ResolveKbiiChar(U'ß', &key, &shift));                        // ß
 }
 
 void test_build_steps_line_breaks() {
@@ -82,6 +109,91 @@ void test_feeder_cadence() {
     const std::vector<std::string> expected = {"0+shift", "4-shift", "14+A", "18-A", "22+1", "26-1"};
     CHECK(r.events == expected);
     CHECK(!f.active());
+}
+
+void test_feeder_kbii_sequence() {
+    KeyPasteFeeder f;
+    f.setPacing(pc1600PastePacing());
+    f.append(buildPasteSteps("\xC3\xA9", pc1600ResolveTypedChar, pc1600ResolveKbiiChar)); // é
+    Recorder r;
+    for (r.frame = 0; r.frame < 200 && f.active(); ++r.frame) f.onFrame(r.press(), r.release());
+    // kbii 4+4 +6, shift 4+4 +6, S 4+4, kbii 4+4 +6.
+    const std::vector<std::string> expected = {"0+kbii", "4-kbii", "14+shift", "18-shift",
+                                               "28+S",   "32-S",   "36+kbii",  "40-kbii"};
+    CHECK(r.events == expected);
+}
+
+// What the user has latched on the machine shapes (or drops) an accented
+// character's sequence -- read when it starts, not when it's queued.
+void test_feeder_kbii_respects_latches() {
+    auto run = [](const KeyLatches& latched) {
+        KeyPasteFeeder f;
+        f.setPacing(pc1600PastePacing());
+        f.append(buildPasteSteps("\xC3\x96" "A", pc1600ResolveTypedChar, pc1600ResolveKbiiChar)); // Ö A
+        std::string keys;
+        auto press = [&keys](const std::string& k) { keys += k + " "; };
+        auto release = [](const std::string&) {};
+        bool first = true;
+        auto latches = [&] {
+            const KeyLatches l = first ? latched : KeyLatches{};
+            first = false;
+            return l;
+        };
+        for (int frame = 0; frame < 200 && f.active(); ++frame) f.onFrame(press, release, latches);
+        return keys;
+    };
+    CHECK(run(KeyLatches{}) == "kbii R kbii A ");
+    CHECK(run(KeyLatches{true, false}) == "shift kbii R kbii A ");  // SHIFT un-latched first
+    CHECK(run(KeyLatches{false, true}) == "A ");                    // KBII on: dropped
+    CHECK(run(KeyLatches{true, true}) == "A ");
+}
+
+void test_feeder_cancel_closes_kbii() {
+    const std::string text = "\xC3\x84" "B"; // Ä then B
+    // Cancelled while the letter is held: release it, then only the closing KBII tap.
+    {
+        KeyPasteFeeder f;
+        f.setPacing(pc1600PastePacing());
+        f.append(buildPasteSteps(text, pc1600ResolveTypedChar, pc1600ResolveKbiiChar));
+        Recorder r;
+        for (r.frame = 0; r.frame <= 14; ++r.frame) f.onFrame(r.press(), r.release()); // Q pressed at 14, cancel at 15
+        f.cancel(r.release(), /*finishKbii=*/true);
+        for (; r.frame < 100 && f.active(); ++r.frame) f.onFrame(r.press(), r.release());
+        const std::vector<std::string> expected = {"0+kbii", "4-kbii", "14+Q", "15-Q", "15+kbii", "19-kbii"};
+        CHECK(r.events == expected);
+    }
+    // Cancelled while the opening KBII is still held: it runs to the end, then closes.
+    {
+        KeyPasteFeeder f;
+        f.setPacing(pc1600PastePacing());
+        f.append(buildPasteSteps(text, pc1600ResolveTypedChar, pc1600ResolveKbiiChar));
+        Recorder r;
+        f.onFrame(r.press(), r.release()); // kbii pressed at frame 0
+        f.cancel(r.release(), /*finishKbii=*/true);
+        for (r.frame = 1; r.frame < 100 && f.active(); ++r.frame) f.onFrame(r.press(), r.release());
+        const std::vector<std::string> expected = {"0+kbii", "4-kbii", "8+kbii", "12-kbii"};
+        CHECK(r.events == expected);
+    }
+    // Cancelled after the closing tap: nothing left to do.
+    {
+        KeyPasteFeeder f;
+        f.setPacing(pc1600PastePacing());
+        f.append(buildPasteSteps(text, pc1600ResolveTypedChar, pc1600ResolveKbiiChar));
+        Recorder r;
+        for (r.frame = 0; r.frame <= 38; ++r.frame) f.onFrame(r.press(), r.release()); // B held (36-40)
+        f.cancel(r.release(), /*finishKbii=*/true);
+        CHECK(!f.active());
+    }
+    // A reset-style cancel drops everything, KBII sequence or not.
+    {
+        KeyPasteFeeder f;
+        f.setPacing(pc1600PastePacing());
+        f.append(buildPasteSteps(text, pc1600ResolveTypedChar, pc1600ResolveKbiiChar));
+        Recorder r;
+        for (r.frame = 0; r.frame <= 14; ++r.frame) f.onFrame(r.press(), r.release());
+        f.cancel(r.release());
+        CHECK(!f.active());
+    }
 }
 
 void test_feeder_cancel_releases_held_key() {
@@ -218,9 +330,14 @@ void test_pc1500_paste_multiline_types_first_line() {
 
 int run_key_paste_tests() {
     test_build_steps_shift_and_skip();
+    test_build_steps_kbii_case_exact();
+    test_kbii_resolver();
     test_build_steps_line_breaks();
     test_build_steps_pc1500_lacks_digit_row_legends();
     test_feeder_cadence();
+    test_feeder_kbii_sequence();
+    test_feeder_kbii_respects_latches();
+    test_feeder_cancel_closes_kbii();
     test_feeder_cancel_releases_held_key();
     test_pc1600_paste_line_no_enter();
     test_pc1600_paste_multiline_types_first_line();

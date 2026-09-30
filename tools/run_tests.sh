@@ -5,6 +5,21 @@ set -e
 cd "$(dirname "$0")/.."
 clang++ -std=c++17 -Wall -Wextra -O1 \
   Core/CPU/LH5801/LH5801.cpp \
+  Core/Debug/Disasm/Disassembly.cpp \
+  Core/Debug/Disasm/LH5801Disassembler.cpp \
+  Core/Debug/Disasm/Z80Disassembler.cpp \
+  Core/Debug/DebugTarget.cpp \
+  Core/Debug/DebugExpression.cpp \
+  Core/Debug/CpuRegisters.cpp \
+  Core/Debug/MachineDebugTargets.cpp \
+  Core/Debug/SourceMap.cpp \
+  Core/Debug/BreakpointTable.cpp \
+  Core/Debug/RunControl.cpp \
+  Core/Debug/ProgramLoader.cpp \
+  Core/Debug/BasicPointerTable.cpp \
+  Core/Debug/Listing/Listing.cpp \
+  Core/Debug/Listing/SdasListing.cpp \
+  Core/Debug/Listing/ZasmListing.cpp \
   Core/Audio/PiezoSampler.cpp \
   Core/PC1500/PC1500Memory.cpp \
   Core/PC1500/PC1500Machine.cpp \
@@ -30,13 +45,13 @@ clang++ -std=c++17 -Wall -Wextra -O1 \
   Core/PC1600/PC1600BasicTyper.cpp \
   Core/PC1600/PC1600BasicLoader.cpp \
   Core/PC1600/PC1600ProgramPlacement.cpp \
-  Core/PC1600/PC1600MachineImage.cpp \
   Core/PC1600/PC1600MachineCodeLoader.cpp \
   Core/PC1600/PC1600PresetLoader.cpp \
   Core/Display/LcdScreenshot.cpp \
   Core/KeyPaste.cpp \
   Core/MachineCodeFile.cpp \
-  Core/Basic/BasicBinaryImage.cpp \
+  Core/ProgramFile.cpp \
+  Core/DropFile.cpp \
   Core/Basic/BasicProgramSource.cpp \
   Core/tests/lh5801_tests.cpp \
   Core/tests/connector_tests.cpp \
@@ -65,16 +80,21 @@ clang++ -std=c++17 -Wall -Wextra -O1 \
   Core/tests/ce150_tests.cpp \
   Core/tests/pc1600_ce150_tests.cpp \
   Core/tests/ce158_tests.cpp \
-  Core/tests/basic_binary_image_tests.cpp \
   Core/tests/basic_fastloader_tests.cpp \
   Core/tests/pc1600_basicloader_tests.cpp \
   Core/tests/pc1600_program_placement_tests.cpp \
-  Core/tests/pc1600_machine_image_tests.cpp \
   Core/tests/basic_program_source_tests.cpp \
   Core/tests/piezo_sampler_tests.cpp \
   Core/tests/key_paste_tests.cpp \
   Core/tests/lcd_screenshot_tests.cpp \
   Core/tests/machine_code_file_tests.cpp \
+  Core/tests/program_file_tests.cpp \
+  Core/tests/disasm_tests.cpp \
+  Core/tests/debug_target_tests.cpp \
+  Core/tests/listing_tests.cpp \
+  Core/tests/run_control_tests.cpp \
+  Core/tests/host_directory_drive_tests.cpp \
+  Core/tests/pc1600_host_drive_tests.cpp \
   Core/Basic/vendor/sharpdx/libsharpdx.a \
   -lz \
   -o /tmp/lh5801_tests

@@ -47,7 +47,7 @@ public:
     /// Writes one TRACE_EVENT record (LH5801-shaped -- the PC-1500/1500A's
     /// own CPU, or the PC-1600's LH5803 co-processor). Field groups not
     /// populated by the active TRACE_* flags are simply written as their
-    /// zero-initialised `CpuFrame` values, matching TraceWriter.swift.
+    /// zero-initialised `CpuFrame` values.
     void writeFrame(const CpuFrame& f);
     /// Writes one TRACE_EVENT_Z80 record (the PC-1600's SC7852).
     void writeFrame(const Z80CpuFrame& f);
@@ -60,11 +60,16 @@ public:
     /// and `fclose`s the handle. Idempotent -- a second call is a no-op.
     void finish();
 
+    /// Bytes handed to the file so far (header included) -- the file's
+    /// size once stdio flushes, without asking the filesystem.
+    uint64_t bytesWritten() const { return m_bytesWritten; }
+
     ~PC1500TraceFile();
 
 private:
     std::FILE* m_fh = nullptr;
     uint32_t m_eventCount = 0;
+    uint64_t m_bytesWritten = 0;
 
     void writeRecord(uint8_t type, const uint8_t* payload, uint16_t len);
 };

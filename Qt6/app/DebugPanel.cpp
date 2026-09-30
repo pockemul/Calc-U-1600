@@ -1,7 +1,6 @@
 #include "DebugPanel.hpp"
 
 #include <QEvent>
-#include <QFileInfo>
 #include <QFont>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -150,9 +149,8 @@ DebugPanel::DebugPanel(MachineController* controller, QWidget* parent)
     connect(m_dumpMemButton, &QPushButton::clicked, this, &DebugPanel::debugDumpMemory);
     connect(m_dumpCardButton, &QPushButton::clicked, this, &DebugPanel::debugDumpModuleCardAsYaml);
     connect(m_clearButton, &QPushButton::clicked, this, &DebugPanel::clearDebug);
-    connect(m_traceButton, &QToolButton::clicked, this, [this] { setTraceEnabled(!m_traceEnabled); });
+    connect(m_traceButton, &QToolButton::clicked, this, [this] { setTraceEnabled(!m_controller->traceActive()); });
     connect(m_logButton, &QToolButton::clicked, this, &DebugPanel::toggleDebugLevel);
-    connect(m_controller, &MachineController::traceEndedByRebuild, this, &DebugPanel::onTraceEndedByRebuild);
 
     applyChrome();
 }
@@ -163,7 +161,7 @@ QString DebugPanel::selectedOutputText() const {
 }
 
 DebugPanel::~DebugPanel() {
-    if (m_traceEnabled) m_controller->endTrace();
+    m_controller->endTrace();
 }
 
 bool DebugPanel::isDarkMode() const {
@@ -256,16 +254,14 @@ void DebugPanel::clearDebug() {
 // ── TRACE ─────────────────────────────────────────────────────────────
 
 void DebugPanel::setTraceEnabled(bool enabled) {
-    if (m_traceEnabled == enabled) return;
-    m_traceEnabled = enabled;
+    if (m_controller->traceActive() == enabled) return;
 
     if (enabled) {
         const QString dir = AppSettings::traceDirOverride().isEmpty() ? AppPaths::instanceDir()
                                                                         : AppSettings::traceDirOverride();
-        m_tracePath = dir + "/TRACE.bin";
-        if (!m_controller->beginTrace(m_tracePath)) {
-            m_traceEnabled = false;
-            ringWriteAll({fmt("TRACE: couldn't start a capture to %s.", m_tracePath.toStdString().c_str())});
+        const QString path = dir + "/TRACE.bin";
+        if (!m_controller->beginTrace(path)) {
+            ringWriteAll({fmt("TRACE: couldn't start a capture to %s.", path.toStdString().c_str())});
             updateTraceButtonAppearance();
             return;
         }
@@ -277,32 +273,26 @@ void DebugPanel::setTraceEnabled(bool enabled) {
     updateTraceButtonAppearance();
 }
 
-void DebugPanel::onTraceEndedByRebuild() {
-    if (!m_traceEnabled) return;
-    m_traceEnabled = false;
-    ringWriteAll({"TRACE stopped: the machine was rebuilt (model, ROM, module or preset change). "
-                  "Re-enable TRACE to start a new session."});
-    updateTraceButtonAppearance();
-}
-
-void DebugPanel::checkTraceSizeLimit() {
-    // Core writes the file; its size on disk (short of stdio's buffer) is
-    // the running byte count.
-    if (static_cast<std::uint64_t>(QFileInfo(m_tracePath).size()) < m_traceMaxBytes) return;
+void DebugPanel::onFrameTick() {
+    if (!m_traceShownActive) return;
+    if (!m_controller->traceActive()) {
+        // Nothing here stopped it: a machine rebuild did.
+        ringWriteAll({"TRACE stopped: the machine was rebuilt (model, ROM, module or preset change). "
+                      "Re-enable TRACE to start a new session."});
+        updateTraceButtonAppearance();
+        return;
+    }
+    if (m_controller->traceBytes() < m_traceMaxBytes) return;
     ringWriteAll({fmt("TRACE stopped: reached the %llu MB size limit. Re-enable TRACE to start a new session.",
                        static_cast<unsigned long long>(m_traceMaxBytes / 1'000'000))});
     setTraceEnabled(false);
 }
 
-void DebugPanel::onFrameTick() {
-    if (!m_traceEnabled) return;
-    checkTraceSizeLimit();
-}
-
 void DebugPanel::updateTraceButtonAppearance() {
     const bool available = m_controller->hasLiveMachine();
+    m_traceShownActive = m_controller->traceActive();
     const QColor dot = !available ? QColor(255, 0, 0, 128)
-                                   : (m_traceEnabled ? QColor(255, 165, 0) : QColor(128, 128, 128, 128));
+                                   : (m_traceShownActive ? QColor(255, 165, 0) : QColor(128, 128, 128, 128));
     m_traceButton->setIcon(dotIcon(dot));
     m_traceButton->setEnabled(available);
     const QColor bg = available ? m_pillOnColor : m_pillOffColor;
@@ -371,9 +361,10 @@ void DebugPanel::debugDumpPointersPC1500() {
 }
 
 void DebugPanel::debugDumpPointersPC1600() {
-    std::vector<std::string> lines = {"\xE2\x94\x80\xE2\x94\x80 PC-1600 Pointers \xE2\x94\x80\xE2\x94\x80  (SC-7852 view, internal RAM)"};
+    std::vector<std::string> lines = {
+        "\xE2\x94\x80\xE2\x94\x80 PC-1600 Pointers \xE2\x94\x80\xE2\x94\x80  "
+        "(BASIC pointers as stored: high byte first, LH5803 view; \xE2\x86\x92 = Z-80 address)"};
     const int nameWidth = CoreDebug::kPC1600PointerMaxNameLength;
-    std::uint16_t basPrgEnd = 0;
     for (int i = 0; i < CoreDebug::kPC1600PointerCount; ++i) {
         const auto& p = CoreDebug::kPC1600Pointers[i];
         const std::string name = padRight(p.name, nameWidth);
@@ -383,16 +374,46 @@ void DebugPanel::debugDumpPointersPC1600() {
         } else {
             const std::uint8_t b0 = m_controller->debugPeek(p.address);
             const std::uint8_t b1 = m_controller->debugPeek(p.address + 1);
-            const std::uint16_t word = p.value == CoreDebug::PC1600PointerEntry::Value::WordBE
-                ? (static_cast<std::uint16_t>(b0) << 8) | b1
-                : (static_cast<std::uint16_t>(b1) << 8) | b0;
-            if (i == CoreDebug::kPC1600BasPrgEndIndex) basPrgEnd = word;
-            value = fmt("$%04X (%d)", word, word);
+            const bool le = p.value == CoreDebug::PC1600PointerEntry::Value::WordLE;
+            const std::uint16_t word = le ? (static_cast<std::uint16_t>(b1) << 8) | b0
+                                          : (static_cast<std::uint16_t>(b0) << 8) | b1;
+            if (p.value == CoreDebug::PC1600PointerEntry::Value::AddrBE) {
+                if (word & 0x8000)
+                    value = fmt("$%04X off", word);
+                else
+                    value = fmt("$%04X \xE2\x86\x92 %04X", word, pc1600::lh5803ToZ80(word));
+            } else {
+                value = fmt("$%04X (%d)", word, word);
+            }
         }
         lines.push_back(fmt("%s $%04X = %s %s", name.c_str(), p.address, padRight(value, 14).c_str(), p.note));
     }
-    const int gap = static_cast<int>(CoreDebug::kPC1600WorkAreaBase) - static_cast<int>(basPrgEnd);
-    lines.push_back(fmt("work-area base $%04X \xE2\x88\x92 BASPRG_END = %d bytes", CoreDebug::kPC1600WorkAreaBase, gap));
+
+    const CoreDebug::PC1600ProgramAreas areas =
+        CoreDebug::readPC1600ProgramAreas([this](std::uint16_t a) { return m_controller->debugPeek(a); });
+    static const char* const kAreaNames[] = {"S0", "S1", "S2"};
+    const char* titleName = areas.title <= 2 ? kAreaNames[areas.title] : "?";
+    lines.push_back(fmt("%s $F1D5 = $%02X           program area selected (%s)",
+                        padRight("TITLE", nameWidth).c_str(), areas.title, titleName));
+    lines.push_back(fmt("%s $F02B = $%02X / $%02X     ADTBL index of the S0 start / end",
+                        padRight("PRG_BANKS", nameWidth).c_str(), areas.startIndex, areas.endIndex));
+    lines.push_back(fmt("%s = %d bytes   S0 only, whatever TITLE says: RAM_END:00 \xE2\x88\x92 "
+                        "(BASPRG_END + 1) + (5 \xE2\x88\x92 F02CH) \xC3\x97 4000H",
+                        padRight("MEM", nameWidth).c_str(), areas.memS0));
+    for (int i = 0; i < 2; ++i) {
+        const CoreDebug::PC1600SlotProgramArea& sl = areas.slot[i];
+        const std::string name = padRight(fmt("S%d area", i + 1), nameWidth);
+        const std::uint16_t desc = pc1600::slotDescriptorAddress(i + 1);
+        if (!sl.programModule()) {
+            lines.push_back(fmt("%s $%04X   no program module (S%dMTb = $%02X%s)", name.c_str(), desc, i + 1,
+                                sl.mtb, sl.mtb == 0xFE ? ", folded into S0" : ""));
+            continue;
+        }
+        lines.push_back(fmt("%s $%04X   start %04X [%u], end %04X [%u], limit %02X00 [%u]; "
+                            "%d bytes free (STATUS %d)",
+                            name.c_str(), desc, sl.start, sl.startIndex, sl.end, sl.endIndex, sl.limitPage,
+                            sl.limitIndex, sl.freeBytes, 259 + i));
+    }
     ringWriteAll(lines);
 }
 
@@ -492,8 +513,10 @@ bool DebugPanel::batteryCardImage(int slot, int* bankCount, std::vector<std::uin
         *bankCount = m_controller->debugSlotCardBankCount();
         *image = m_controller->debugSlotCardImage();
     }
-    if (*bankCount <= 0 || image->empty() || image->size() % *bankCount != 0) return false;
-    return true;
+    // bankCount <= 0 is an unbanked card (e.g. CE-1600M): one implicit bank,
+    // which formatBatteryCardInitialContentBlock() writes without a `bank:` key.
+    if (image->empty()) return false;
+    return *bankCount <= 0 || image->size() % *bankCount == 0;
 }
 
 void DebugPanel::debugDumpModuleCardAsYaml() {
@@ -505,16 +528,18 @@ void DebugPanel::debugDumpModuleCardAsYaml() {
         std::vector<std::uint8_t> image;
         if (!batteryCardImage(slot, &bankCount, &image)) continue;
         const auto lines = formatBatteryCardInitialContentBlock(bankCount, image);
-        const std::size_t bankSize = image.size() / bankCount;
         const std::string name = m_moduleManager ? m_moduleManager->selectedModuleName(slot).toStdString() : std::string();
         const std::string label = name.empty() ? "attached module" : name;
         const std::string slotLabel = isPC1600 ? fmt(" (Slot %d)", slot) : "";
-        chunks.push_back(fmt("\xE2\x94\x80\xE2\x94\x80 Module card dump: %s%s, %d bank(s) x %s -- paste under the region's initial-content: \xE2\x94\x80\xE2\x94\x80",
-                              label.c_str(), slotLabel.c_str(), bankCount, debugSizeLabel(static_cast<int>(bankSize)).c_str()));
+        const std::string layout = bankCount > 0
+            ? fmt("%d bank(s) x %s", bankCount, debugSizeLabel(static_cast<int>(image.size() / bankCount)).c_str())
+            : fmt("unbanked, %s", debugSizeLabel(static_cast<int>(image.size())).c_str());
+        chunks.push_back(fmt("\xE2\x94\x80\xE2\x94\x80 Module card dump: %s%s, %s -- paste under the region's initial-content: \xE2\x94\x80\xE2\x94\x80",
+                              label.c_str(), slotLabel.c_str(), layout.c_str()));
         chunks.push_back(joinLines(lines));
     }
     if (chunks.empty()) {
-        ringWriteAll({"\xE2\x94\x80\xE2\x94\x80 Module card dump: no card attached, or it has no bank concept \xE2\x94\x80\xE2\x94\x80"});
+        ringWriteAll({"\xE2\x94\x80\xE2\x94\x80 Module card dump: no card attached, or it has no dumpable RAM \xE2\x94\x80\xE2\x94\x80"});
         return;
     }
     ringWriteAll(chunks);

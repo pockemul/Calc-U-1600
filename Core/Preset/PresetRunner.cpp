@@ -6,7 +6,6 @@
 #include <fstream>
 #include <iterator>
 
-#include "../Basic/BasicProgramSource.hpp"
 #include "../Connector/MemoryCardCatalog.hpp"
 #include "../Connector/SoftwareDefinedCard.hpp"
 #include "../TraceTypes.hpp"
@@ -140,11 +139,14 @@ bool runSteps(PresetMachine& machine, const std::vector<PresetStep>& steps, std:
     return true;
 }
 
-// `format: binary`: a machine-code block. The file may carry a CE-158
+// A machine-code `program:` block. The file may carry a CE-158
 // (PC-1500) or PC-1600 header (machinecode::readFile()) giving the load
 // address, length and an auto-run address; the preset's `address:` /
 // `length:` override the header's fields, and a headerless file needs
-// `address:` (its length defaults to the whole file). A non-zero auto-run
+// `address:` (its length defaults to the whole file). On the PC-1600 the
+// machine's MODE and TITLE decide the CPU and the target, as for Load
+// Machine Code (in MODE 1 a headerless file's `address:` is an LH5803
+// address); the preset switches MODE / TITLE itself. A non-zero auto-run
 // address makes the loader type `CALL &<addr>` afterwards and wait for the
 // interpreter to come back -- the machine must be in RUN mode by then.
 bool loadBinaryProgram(PresetMachine& machine, const PresetProgram& program, const std::string& tag,
@@ -162,43 +164,55 @@ bool loadBinaryProgram(PresetMachine& machine, const PresetProgram& program, con
     const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 
     const machinecode::File file = machinecode::readFile(bytes);
-    if (!file.ok && !(file.lengthMismatch && program.hasLength)) {
-        *error = tag + program.path + ": " + file.error;
-        if (file.lengthMismatch) *error += " Add an explicit 'length:' to override.";
-        return false;
-    }
-    const std::string mismatch = machinecode::headerMismatch(machine.codeTarget(), file);
-    if (!mismatch.empty()) {
-        *error = tag + program.path + ": " + mismatch;
-        return false;
+    // A preset's rules: `address:` / `length:` override the header (a
+    // `length:` also accepts a header whose length disagrees), the target
+    // follows the machine's MODE / TITLE, and the writer checks the range.
+    const machinecode::PC1600State state = machine.codeState();
+    machinecode::LoadOptions options;
+    options.target = machine.codeTarget();
+    options.acceptLengthMismatch = program.hasLength;
+    options.hasAddress = program.hasAddress;
+    options.address = program.address;
+    options.hasLength = program.hasLength;
+    options.length = program.length;
+    options.checkRange = false;
+    const machinecode::LoadPlan plan = machinecode::planLoad(file, options, state);
+    switch (plan.error) {
+        case machinecode::LoadError::None: break;
+        case machinecode::LoadError::BadFile:
+            *error = tag + program.path + ": " + file.error;
+            if (file.lengthMismatch) *error += " Add an explicit 'length:' to override.";
+            return false;
+        case machinecode::LoadError::NeedsAddress:
+            *error = tag + program.path + " has no machine-code header: 'address' is required";
+            return false;
+        case machinecode::LoadError::Empty:
+            *error = tag + "program is empty (length 0)";
+            return false;
+        case machinecode::LoadError::LengthExceeds:
+            *error = tag + "'length' " + std::to_string(program.length) + " exceeds the " +
+                     std::to_string(file.payload.size()) + " program bytes available in " + program.path;
+            return false;
+        case machinecode::LoadError::LhRange:
+            *error = tag + program.path + ": LH5803 code must sit in &0000-&7FFF";
+            return false;
+        default: // HeaderMismatch, NoSlot
+            *error = tag + program.path + ": " + plan.detail;
+            return false;
     }
     const bool hasHeader = file.header != machinecode::File::Header::None;
-    if (!hasHeader && !program.hasAddress) {
-        *error = tag + program.path + " has no machine-code header: 'address' is required";
-        return false;
-    }
-
-    const uint32_t addr = program.hasAddress ? program.address : file.loadAddr;
-    const size_t len = program.hasLength ? program.length : file.payload.size();
-    if (len == 0) {
-        *error = tag + "program is empty (length 0)";
-        return false;
-    }
-    if (len > file.payload.size()) {
-        *error = tag + "'length' " + std::to_string(len) + " exceeds the " + std::to_string(file.payload.size()) +
-                 " program bytes available in " + program.path;
-        return false;
-    }
+    const uint32_t addr = plan.addr;
+    const size_t len = plan.len;
     std::string loadError;
-    if (!machine.loadMachineCode(program, addr, file.payload.data(), len, &loadError)) {
+    if (!machine.loadMachineCode(plan.slot, plan.busAddr, file.payload.data(), len, &loadError)) {
         *error = tag + "binary " + program.path + ": " + loadError;
         return false;
     }
     if (log) {
-        const char* slot = program.slot == PresetProgram::Slot::S0   ? ", slot S0"
-                           : program.slot == PresetProgram::Slot::S1 ? ", slot S1"
-                           : program.slot == PresetProgram::Slot::S2 ? ", slot S2"
-                                                                     : "";
+        const bool pc1600 = machine.codeTarget() == machinecode::Target::PC1600;
+        const std::string slot = pc1600 ? std::string(", ") + machinecode::slotName(plan.slot) +
+                                              (plan.cpu == machinecode::Cpu::LH5803 ? ", LH5803 address" : "")
+                                        : "";
         char range[40];
         std::snprintf(range, sizeof(range), "$%04X..$%04X", addr, static_cast<uint32_t>(addr + len - 1));
         log(tag + "binary " + program.path + " (" + std::to_string(len) + " bytes" + (hasHeader ? ", header" : "") +
@@ -215,15 +229,19 @@ bool loadBinaryProgram(PresetMachine& machine, const PresetProgram& program, con
             *error = tag + b;
             return false;
         }
-        char line[24];
-        std::snprintf(line, sizeof(line), "CALL &%X", file.autorunAddr);
+        // The same CALL Load Machine Code proposes: `CALL #2,&<addr>` for
+        // code in slot 2 (global bank 2), `XCALL` for LH5801 code, `CALL
+        // &<addr>` otherwise.
+        const std::string line = machinecode::advice(machine.codeTarget(), plan.slot, addr, len,
+                                                     file.autorunAddr, 0, 0, state, plan.cpu)
+                                     .callCommand;
         std::string typeError;
         if (!machine.typeLine(line, &typeError)) {
             *error = tag + "auto-run '" + line + "' failed: " + typeError;
             return false;
         }
         machine.waitUntilBasicIdle(static_cast<uint64_t>(machine.cyclesPerSecond()) * kSecondsPerHour);
-        if (log) log("  auto-run " + std::string(line) + machine.stepTag());
+        if (log) log("  auto-run " + line + machine.stepTag());
     }
     return true;
 }
@@ -232,7 +250,7 @@ bool runProgram(PresetMachine& machine, const PresetProgram& program, const std:
                 PresetLoadResult* result, const PresetLogFn& log) {
     switch (program.format) {
         case PresetProgram::Format::BasicText: {
-            if (log) log(tag + "program (basic-text, " + std::to_string(countLines(program.text)) + " lines)");
+            if (log) log(tag + "program (typed, " + std::to_string(countLines(program.text)) + " lines)");
             BasicTypeResult typed = machine.typeBasicProgram(program.text);
             for (const std::string& rejected : typed.rejectedLines) {
                 result->rejectedBasicLines.push_back(rejected);
@@ -247,16 +265,10 @@ bool runProgram(PresetMachine& machine, const PresetProgram& program, const std:
             return true;
         }
         case PresetProgram::Format::BasicBinary: {
-            basic::BasicProgramSource src = basic::readBasicProgramSource(program.path, machine.transferModel());
-            if (!src.ok) {
-                result->error = tag + src.error;
-                if (log) log(tag + "basic-binary FAILED: " + src.error);
-                return false;
-            }
-            if (log) log(tag + "program (basic-binary, " + std::to_string(src.payload.size()) + " tokenized bytes)");
-            BasicLoadResult loaded = machine.loadBasicPayload(src.payload);
+            if (log) log(tag + "program (BASIC, " + program.path + ")");
+            BasicLoadResult loaded = machine.loadBasicFile(program.path);
             if (!loaded.ok) {
-                result->error = "basic-binary load failed: " + loaded.error;
+                result->error = tag + "BASIC load failed: " + loaded.error;
                 if (log) log("  " + result->error);
                 return false;
             }

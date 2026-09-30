@@ -8,9 +8,11 @@
 #include <string>
 #include <vector>
 
+#include "../Connector/BusRomCard.hpp"
+#include "../CPU/DebugStop.hpp"
 #include "../CPU/LH5801/LH5801.hpp"
 #include "../Connector/Ce150Card.hpp"
-#include "../Connector/Ce158Card.hpp"
+#include "../Connector/Ce158Port.hpp"
 #include "../Connector/ExpansionConnector.hpp"
 #include "../Connector/SystemBus.hpp"
 #include "PC1500Clocks.hpp"
@@ -206,11 +208,11 @@ public:
     PC1500Memory&       memory() { return m_memory; }
     const PC1500Memory& memory() const { return m_memory; }
 
-    // The 40-pin (single-slot) and 60-pin (daisy-chain) connectors, wired
-    // into m_memory by the constructor. No card is attached by default --
-    // tests and the app layer attach directly via these accessors.
-    ExpansionConnector& expansionConnector() { return m_expansionConnector; }
-    SystemBus&          systemBus() { return m_systemBus; }
+    // The 40-pin (single-slot) and 60-pin (daisy-chain) connectors, owned
+    // by m_memory. No card is attached by default -- tests and the app
+    // layer attach directly via these accessors.
+    ExpansionConnector& expansionConnector() { return m_memory.expansionConnector(); }
+    SystemBus&          systemBus() { return m_memory.systemBus(); }
 
     /// Takes ownership of `card` and attaches it to the 40-pin
     /// ExpansionConnector -- for callers (the preset loader, the CLI) with
@@ -220,7 +222,7 @@ public:
     /// m_mutex: the emulation thread dispatches bus accesses to the card.
     void attachExpansionCard(std::unique_ptr<ExpansionCard> card) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_expansionConnector.attach(card.get());
+        m_memory.expansionConnector().attach(card.get());
         m_attachedExpansionCard = std::move(card); // old card freed only after it's unplugged
     }
 
@@ -230,7 +232,7 @@ public:
     // window (guest 0xA000-0xBFFF, ME0) and its LH5810 register block
     // (guest 0xB008-0xB00F, ME1) are both served by the card off that bus.
     // `attachCE150` builds a card, loads its 8 KB ROM, resets it, and
-    // attaches it to `m_systemBus`. A chip/machine reset does not clear the
+    // attaches it to the memory's `systemBus()`. A chip/machine reset does not clear the
     // attachment (it does re-anchor the card -- see reset()).
     bool attachCE150(const uint8_t* rom, size_t romSize);
     void detachCE150();
@@ -256,9 +258,16 @@ public:
     // stays put while the user toggles the interface.
     bool attachCE158(const uint8_t* rom, size_t romSize);
     void detachCE158();
-    bool ce158Attached() const { return m_ce158Card != nullptr; }
+
+    // ── Bus ROMs (preset `bus-rom:`, Connector/BusRomCard.hpp) ────────────
+    //
+    // A plain ROM on the same SystemBus chain, in front of every other card
+    // there, so a rebuilt ROM shadows a bundled one at the same place. Kept
+    // for the machine's lifetime; a preset builds a fresh machine.
+    void attachBusRom(std::unique_ptr<BusRomCard> card);
+    bool ce158Attached() const { return m_ce158.attached(); }
     /// Unlocked direct access -- headless/tests only (see ce150Card()).
-    Ce158Card* ce158Card() { return m_ce158Card.get(); }
+    Ce158Card* ce158Card() { return m_ce158.card(); }
     /// Non-owning; the caller keeps `link` alive until it sets another one
     /// (or nullptr) or destroys the machine. GUI-safe (takes m_mutex).
     void setCE158SerialLink(SerialLink* link);
@@ -295,20 +304,32 @@ public:
     void endCpuTrace();
 
     bool cpuTraceActive() const { return m_traceFile != nullptr; }
-    void addBreakpoint(uint16_t addr) { m_cpu.addBreakpoint(addr); }
-    void removeBreakpoint(uint16_t addr) { m_cpu.removeBreakpoint(addr); }
-    void clearBreakpoints() { m_cpu.clearBreakpoints(); }
-    bool consumeBreakpointHit() { return m_cpu.consumeBreakpointHit(); }
+    /// Size of the active capture so far (0 when none); see
+    /// PC1500TraceFile::bytesWritten().
+    uint64_t cpuTraceBytes() const { return m_traceFile ? m_traceFile->bytesWritten() : 0; }
+    // ── Debugger stops ────────────────────────────────────────────────────
+    /// step() and runCycles() latch a stop when the CPU parks on a PC
+    /// breakpoint (nothing executed) or completes an instruction whose data
+    /// access hit a watch; runCycles() then returns early. Cleared by a
+    /// reset.
+    DebugStop consumeDebugStop() { return m_debugStop.consume(); }
+    /// Memory watches of CPU 1 (the only one); nullptr turns checking off.
+    /// Not owned.
+    void setWatches(int cpu, WatchSet* watches) {
+        if (cpu != 1) return;
+        m_watches = watches;
+        m_cpu.setWatches(watches);
+    }
 
 private:
     PC1500Memory m_memory;
     LH5801       m_cpu;
-    ExpansionConnector m_expansionConnector;
-    SystemBus          m_systemBus;
+    WatchSet*    m_watches{nullptr};
+    DebugStopLatch m_debugStop;
     std::unique_ptr<ExpansionCard> m_attachedExpansionCard; // see attachExpansionCard()
     std::unique_ptr<Ce150Card> m_ce150Card;                 // see attachCE150()
-    std::unique_ptr<Ce158Card> m_ce158Card;                 // see attachCE158()
-    SerialLink* m_ce158Link = nullptr;                      // see setCE158SerialLink()
+    Ce158Port m_ce158;                                      // see attachCE158()
+    std::vector<std::unique_ptr<BusRomCard>> m_busRoms;     // see attachBusRom()
     mutable std::mutex m_mutex;
 
     // See setYieldHook(). m_yieldCountdown only runs down while a hook is set.

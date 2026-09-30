@@ -6,9 +6,10 @@
 // ── Screenshot scenario (`*.shots.yaml`) ──────────────────────────────────
 //
 // A scripted walk through the GUI that ends in image captures -- for the
-// user guide (docs/screenshots/) and as a GUI smoke test. The format
-// reference is docs/screenshots/README.md. Parsed with Core's YAML subset
-// (Core/Yaml.hpp); all-or-nothing, line-numbered errors, like presets.
+// user guide (docs/developer/screenshots/) and as a GUI smoke test. The
+// format reference is docs/developer/screenshots/README.md. Parsed with
+// Core's YAML subset (Core/Yaml.hpp); all-or-nothing, line-numbered errors,
+// like presets.
 //
 // Presets stay in charge of emulator state (model, cards, typed input): a
 // shot starts from one (`preset:`), then its `steps:` drive the Qt UI --
@@ -18,8 +19,11 @@
 struct ShotCaptureSpec {
     enum class Method { Qt, System };
     Method method = Method::Qt;
-    // window | dialog | plot | lcd-image | screen-region | <objectName>
-    QString target = QStringLiteral("window");
+    // `target:` -- window | dialog | plot | lcd-image | screen-region, or
+    // any other word: the objectName of a widget (Widget).
+    enum class Target { Window, Dialog, Plot, LcdImage, ScreenRegion, Widget };
+    Target target = Target::Window;
+    QString objectName; // Target::Widget only
     QString file;      // relative to the output directory
     int padding = 0;   // logical px of margin around the captured area
     double scale = 0;  // device pixels per logical px; 0 = the scenario's

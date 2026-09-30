@@ -29,10 +29,12 @@ struct PinState {
     // Pin roles per host (a card must not care which):
     //   pin[2]  PC-1500 PV        / PC-1600 PVIN
     //   pin[3]  PC-1500 PU        / PC-1600 PU
+    //   (The 60-pin cards CE-150/CE-158 also read PV/PU here, a shortcut:
+    //   on the 60-pin plug they are contacts 15/16. TODO.md.)
     //   pin[4]  PC-1500 Y0 (CS &0000-&3FFF) / PC-1600 RAM2 (Slot 1) or RAM1 (Slot 2) CS
     //   pin[5]  PC-1500 S4        / PC-1600 PVOUT
     //   pin[6]  PC-1500 DME0      / PC-1600 MREQ
-    //   pin[15] INHIBIT / INH (see ExpansionCard::assertsInhibit -- output from the card)
+    //   pin[15] INHIBIT / INH (see InhibitSource -- output from the card)
     //   pin[16] PC-1500 S1 (PC-1500A S3) / PC-1600 S1 (Slot 1) or K0 (Slot 2)
     //   pin[17] PC-1500 S2 (PC-1500A S4) / PC-1600 S2 (Slot 1) or K1 (Slot 2)
     //   pin[18] PC-1500 S3 (PC-1500A S5) / PC-1600 S3 (Slot 1) or K2 (Slot 2)
@@ -62,30 +64,44 @@ struct PinState {
     bool ioWrite = false;
 };
 
-class ExpansionCard {
+// What a card did with a write. Converts to bool as "claimed" (the bus
+// stops looking for another responder), which is all a guest-CPU store
+// needs; a host poke() also asks whether the byte was actually stored.
+struct WriteResult {
+    bool claimed = false;
+    bool stored = false;
+
+    /// Not this card's access.
+    static constexpr WriteResult ignored() { return {false, false}; }
+    /// Claimed, but the value went nowhere (mask ROM, write-protected
+    /// RAM, a read-only register).
+    static constexpr WriteResult refused() { return {true, false}; }
+    /// Claimed and acted on (stored, or latched into a register).
+    static constexpr WriteResult taken() { return {true, true}; }
+
+    constexpr operator bool() const { return claimed; }
+};
+
+// A card that can drive INHIBIT (Expansion-Connectors.md's INHIBIT/INH
+// pin, pin 15) to suppress the host's internal ROM and substitute its own
+// content derives from this too. Connectors look for it once, when the
+// card is attached, so the (usual) cards without it cost nothing on each
+// host-ROM fetch -- and a card can't answer assertsInhibit() without
+// declaring the capability. Polarity-free at this interface: "true =
+// suppress ROM"; the connector applies the host's electrical polarity (the
+// PC-1500 pulls the pin low, the PC-1600 drives it high).
+class InhibitSource {
 public:
-    virtual ~ExpansionCard() = default;
+    virtual ~InhibitSource() = default;
+    virtual bool assertsInhibit() const = 0;
+};
 
-    /// Return true and set outValue if this card responds to this access.
-    /// Returning false leaves the bus open (0xFF).
-    virtual bool respondsToRead(const PinState& pins, uint8_t& outValue) const = 0;
-
-    /// Return true if this card claims (and thus acts on) this write.
-    virtual bool respondsToWrite(const PinState& pins, uint8_t value) = 0;
-
-    /// Asserted (Expansion-Connectors.md's INHIBIT/INH pin, pin 15) to
-    /// suppress the host's internal ROM, letting the card substitute its
-    /// own content. Polarity-free at this interface -- "true = suppress
-    /// ROM"; the connector applies the host's electrical polarity (the
-    /// PC-1500 pulls the pin low, the PC-1600 drives it high). Most cards
-    /// never assert this.
-    virtual bool assertsInhibit() const { return false; }
-
-    /// Whether this card can ever assert INHIBIT. Asked once, when the card
-    /// is attached, so a connector can skip the assertsInhibit() call on
-    /// every host-ROM fetch for the (usual) cards that never do. A card
-    /// that overrides assertsInhibit() must override this to return true.
-    virtual bool mayAssertInhibit() const { return false; }
+// What every card has regardless of which plug it fits: debug views of
+// its storage and its name. The bus-facing half (which pins it decodes)
+// lives in the per-plug interface derived from this.
+class CardBase {
+public:
+    virtual ~CardBase() = default;
 
     /// The bank index this card currently exposes through its main banked
     /// window, for the GUI debug "Dump Mem" panel's per-column labels.
@@ -116,6 +132,12 @@ public:
     /// whole number of 16 KB banks (the slot cards) labels them bank 0..N.
     virtual std::vector<uint8_t> debugImage() const { return {}; }
 
+    /// Bumped whenever debugImage()'s content changes -- a stored byte that
+    /// took a new value, a flash erase, a debugImageWrite() -- so a host
+    /// that persists the card compares one number instead of the whole
+    /// image. Stays 0 for a card with no writable storage.
+    virtual uint64_t contentRevision() const { return 0; }
+
     /// The write counterpart of debugImage(): overwrite `n` bytes of the
     /// backing store starting at concatenated offset `off` (same address
     /// space debugImage() returns). For a host-side debug / program-loader
@@ -133,4 +155,22 @@ public:
     /// so the GUI can read what sits in a slot from the slot itself.
     /// Empty for a card without one (test stubs).
     virtual std::string moduleName() const { return {}; }
+};
+
+// A card on a connector numbered with PinState's 40-pin contacts.
+class ExpansionCard : public CardBase {
+public:
+    /// Return true and set outValue if this card responds to this access.
+    /// Returning false leaves the bus open (0xFF).
+    virtual bool respondsToRead(const PinState& pins, uint8_t& outValue) const = 0;
+
+    /// Whether this card claims this write, and whether it stored it
+    /// (see WriteResult).
+    virtual WriteResult respondsToWrite(const PinState& pins, uint8_t value) = 0;
+
+    /// Whether reading this access would change the card's state (a UART
+    /// data register, a status flag cleared on read), so a debugger view
+    /// must not read it. Lets a host's debug peek skip such addresses
+    /// without knowing which card sits where. Default: reads are harmless.
+    virtual bool readHasSideEffects(const PinState& /*pins*/) const { return false; }
 };

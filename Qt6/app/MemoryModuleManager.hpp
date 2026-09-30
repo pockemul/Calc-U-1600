@@ -5,6 +5,7 @@
 #include <QTimer>
 #include <QVector>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "MachineController.hpp"
@@ -71,7 +72,7 @@ public:
     // have. The module's name is read from the machine's slot itself
     // (ExpansionCard::moduleName()) -- an empty slot clears the selection.
     // `resolvedPathOrEmpty` is
-    // the on-disk file a `modulespec:`/`modulespecfile:` reference resolved
+    // the on-disk file a `slot-N:`/`slot-N-file:` reference resolved
     // to (PresetLoadResult::slot1ResolvedPath / slot2ResolvedPath), empty
     // for an empty slot. The file itself says what it is (classifySlot()):
     // an instance becomes autosave-eligible exactly as if it had been
@@ -83,15 +84,19 @@ public:
     // and a user template must never be overwritten).
     bool nameAndSave(int slot, const QString& instanceName, QString* error);
 
-    // Preset `saveas:s1:<name>` / `saveas:s2:<name>` (PresetController's
-    // PresetSaveAsFn callback). Like nameAndSave(),
-    // the slot is then retargeted at the new instance (shown under that
-    // name, autosaving there), but unlike it: works even when the slot is
-    // already saved (a "save as" -- the previous instance file just stops
-    // being autosaved), and silently overwrites an existing instance file
-    // of the same name instead of refusing. A template's name is still
-    // refused, and a template file is never overwritten.
-    bool saveAsFromPreset(int slot, const QString& instanceName, QString* error);
+    // Preset `saveas: template|live s1:<name>` / `s2:` (PresetController's
+    // PresetSaveAsFn callback). Like nameAndSave(), the slot is then
+    // retargeted at the saved file (shown under that name; a live save
+    // autosaves there, a template doesn't), but unlike it: works even when
+    // the slot is already saved (a "save as" -- the previous instance file
+    // just stops being autosaved), and silently overwrites an existing file
+    // of the same name. A by-name save refuses a bundled name; a live one
+    // also refuses the name of a user template and never overwrites a
+    // template file, a template one may replace a user template. `filePath` (the `file:` form)
+    // writes exactly that file, with no name checks; empty = the instance
+    // directory.
+    bool saveAsFromPreset(int slot, const QString& instanceName, const QString& filePath, bool asTemplate,
+                          QString* error);
 
     void markDirtyAndSchedulePersist();  // called once per frame tick
     void flushPendingPersist();          // called before select/model-switch/quit
@@ -115,10 +120,11 @@ signals:
 private:
     // Shared body of nameAndSave()/saveAsFromPreset(); `fromPreset` skips
     // the already-saved and name-collision checks.
-    bool saveSlotAs(int slot, const QString& instanceName, bool fromPreset, QString* error);
-    // Every template's module-name (bundled or in the storage folder, all
-    // hosts), and every bundled card's module-name.
-    QSet<QString> templateNames() const;
+    bool saveSlotAs(int slot, const QString& instanceName, bool fromPreset, QString* error,
+                    const QString& filePath = QString(), bool asTemplate = false);
+    // Every template's module-name in the storage folder (all hosts), and
+    // every bundled card's module-name.
+    QSet<QString> userTemplateNames() const;
     QSet<QString> bundledNames() const;
     bool nameCollides(const QString& instanceName) const;
 
@@ -131,9 +137,10 @@ private:
         bool battery = false;      // that file declares `battery: true`
         QString instanceFilePath;  // == sourcePath for an instance (autosaved there), else empty
         bool persistPending = false;
-        // The card image as last attached from / written to
-        // instanceFilePath; empty = unknown, so the next persist writes.
-        std::vector<uint8_t> persistedImage;
+        // The card's contentRevision() when it was last attached from /
+        // written to instanceFilePath; unset = unknown, so the next persist
+        // writes.
+        std::optional<uint64_t> persistedRevision;
     };
     // Records `resolvedPath` as the slot's source and classifies it from the
     // file's own `template:` key. Empty path = no file (clears the source).
@@ -144,6 +151,7 @@ private:
 
     CardHost hostFor(int slot) const;
     bool currentSlotImage(int slot, int* bankCount, std::vector<uint8_t>* image) const;
+    uint64_t currentSlotRevision(int slot) const;  // the attached card's contentRevision()
     void writeInstance(int slot);  // re-splice + rewrite slot's instance file, if the card changed
 
     // Reads `sourcePath`, splices the card `image` (`bankCount` banks) into it as
@@ -153,7 +161,7 @@ private:
     // (best-effort re-splice; pass `error` as nullptr to fail silently).
     bool spliceCardImageInto(int bankCount, const std::vector<uint8_t>& image, const QString& sourcePath,
                              const QString& sourceModuleName, const QString& targetName, std::string* spliced,
-                             QString* error);
+                             QString* error, bool asTemplate = false);
 
     // The name of the module in `slot` of the live machine, "" when empty.
 

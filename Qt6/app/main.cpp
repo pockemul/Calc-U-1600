@@ -1,27 +1,70 @@
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QDir>
+#include <QFileOpenEvent>
 #include <QIcon>
 #include <QTemporaryDir>
 #include <cstdio>
+#include <functional>
+#include <utility>
 #include "AppLogging.hpp"
 #include "AppPaths.hpp"
 #include "AppSettings.hpp"
+#ifdef __APPLE__
+#include "MacAppSupport.h"
+#endif
 #include "MainWindow.hpp"
+#include "debug/DebugController.hpp"
 #include "screenshots/ShotRunner.hpp"
 #include "screenshots/ShotScenario.hpp"
 
+namespace {
+
+// macOS hands a file dropped onto the Dock icon, or opened from Finder, to
+// the application object as a QFileOpenEvent -- at a cold launch before
+// there is a window. Kept until the window takes them (openDroppedFile()).
+class Application : public QApplication {
+public:
+    using QApplication::QApplication;
+
+    void setFileOpenHandler(std::function<void(const QString&)> handler) {
+        m_onFileOpen = std::move(handler);
+        for (const QString& path : std::exchange(m_pending, {})) m_onFileOpen(path);
+    }
+
+protected:
+    bool event(QEvent* event) override {
+        if (event->type() != QEvent::FileOpen) return QApplication::event(event);
+        const QString path = static_cast<QFileOpenEvent*>(event)->file();
+        if (m_onFileOpen)
+            m_onFileOpen(path);
+        else
+            m_pending.append(path);
+        return true;
+    }
+
+private:
+    std::function<void(const QString&)> m_onFileOpen;
+    QStringList m_pending;
+};
+
+}  // namespace
+
 int main(int argc, char** argv) {
     AppLogging::install();
-    QApplication app(argc, argv);
+#ifdef __APPLE__
+    macDisableWindowRestoration(); // see MacAppSupport.h: the restore prompt deadlocks the startup preset
+    macDisablePressAndHold();      // see MacAppSupport.h: held letters stay held keys
+#endif
+    Application app(argc, argv);
     // Without this, the running window's title-bar/taskbar icon is
     // whatever the platform defaults to (e.g. a generic AppImage icon on
     // Linux) -- the .desktop file's Icon= only covers desktop-environment
     // integration (launcher/file-manager icon), not the live window.
     app.setWindowIcon(QIcon(":/app/icon.png"));
 
-    // Scripted screenshots (docs/screenshots/README.md): play a scenario,
-    // write its images, quit with 0 (all written) or 1 (any failed).
+    // Scripted screenshots (docs/developer/screenshots/README.md): play a
+    // scenario, write its images, quit with 0 (all written) or 1 (any failed).
     QCommandLineParser parser;
     const QCommandLineOption shotsOption(QStringLiteral("shots"),
                                          QStringLiteral("Run a screenshot scenario (*.shots.yaml), then quit."),
@@ -34,15 +77,23 @@ int main(int argc, char** argv) {
                                              QStringLiteral("names"));
     const QCommandLineOption shotsFailFastOption(QStringLiteral("shots-fail-fast"),
                                                  QStringLiteral("Stop at the first failing shot."));
-    parser.addOptions({shotsOption, shotsOutOption, shotsOnlyOption, shotsFailFastOption});
+    const QCommandLineOption dapOption(QStringLiteral("dap"),
+                                       QStringLiteral("Accept a debugger on 127.0.0.1:<port> for this run (Settings unchanged)."),
+                                       QStringLiteral("port"));
+    parser.addOptions({shotsOption, shotsOutOption, shotsOnlyOption, shotsFailFastOption, dapOption});
     // parse(), not process(): a normal launch must survive whatever extra
     // arguments macOS or an IDE add (`-NSDocumentRevisionsDebugMode YES`).
     const bool parsed = parser.parse(QCoreApplication::arguments());
 
+    if (parser.isSet(dapOption)) DebugController::setCommandLinePort(parser.value(dapOption).toInt());
+
     if (!parser.isSet(shotsOption)) {
         MainWindow window;
         window.show();
-        return app.exec();
+        app.setFileOpenHandler([&window](const QString& path) { window.openDroppedFile(path); });
+        const int result = app.exec();
+        app.setFileOpenHandler({});
+        return result;
     }
 
     if (!parsed) {

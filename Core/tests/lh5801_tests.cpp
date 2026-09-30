@@ -169,7 +169,7 @@ void test_adr_preserves_flags() {
     // This behavior contradicts the PC-1500 TRM's own text (which says ADR
     // does change C/H/Z/V, and backs it with a worked example), but is
     // confirmed on real hardware (PC-1500A) via
-    // examples/debug/adrtest_1500a.asm.
+    // dev/hardware-checks/adrtest_1500a.asm.
 
     // sec ; ldi a,0x00 ; ldi yh,0x7B ; ldi yl,0xB2 ; adr y
     // Adding 0 produces no carry out, so a flag-clobbering ADR would clear
@@ -433,7 +433,7 @@ void test_trace_ring_peek_does_not_consume() {
 
 void test_breakpoint_halts_step() {
     Rig r({0xB5, 0x01, 0xB5, 0x02, 0xB5, 0x03});
-    r.cpu.setTraceFlags(TRACE_BREAKPOINTS);
+    r.cpu.setBreakpointsEnabled(true);
     r.cpu.addBreakpoint(0x8002);
     int c = r.cpu.step(); // executes ldi a,0x01 (pc was 0x8000, not the breakpoint)
     CHECK(c != 0);
@@ -1382,6 +1382,12 @@ int run_ce1600p_tests();
 // Defined in ce1600f_tests.cpp -- CE1600FCard, the CE-1600F floppy's
 // register-level protocol (confirmed via ROM disassembly).
 int run_ce1600f_tests();
+// Defined in host_directory_drive_tests.cpp -- HostDirectoryDrive, the
+// file-level half of the PC-1600 host-directory drive (S3: / Y:).
+int run_host_directory_drive_tests();
+// Defined in pc1600_host_drive_tests.cpp -- the host-directory drive end to
+// end: real PC-1600 ROM + driver ROM + PC1600HostDriveCard, BASIC typed.
+int run_pc1600_host_drive_tests();
 // Defined in ce150_tests.cpp -- Ce150Card (LH5810 + ROM window decode) and
 // its PC1500Machine / 60-pin SystemBus integration.
 int run_ce150_tests();
@@ -1391,24 +1397,18 @@ int run_pc1600_ce150_tests();
 // Defined in ce158_tests.cpp -- Ce158Card (ROM window, LH5811, CDP1854 UART,
 // Centronics) and the CE-158 driven by BASIC on a PC1500Machine.
 int run_ce158_tests();
-// Defined in basic_binary_image_tests.cpp -- the SharpDataExchange
-// tokenized-BASIC transfer-file parser (Core/Basic/BasicBinaryImage).
-int run_basic_binary_image_tests();
 // Defined in basic_fastloader_tests.cpp -- PC1500BasicLoader (poke +
 // BASPRG_END fix), checked byte-for-byte against the keystroke typer.
 int run_basic_fastloader_tests();
 // Defined in pc1600_basicloader_tests.cpp -- PC1600BasicLoader, same
 // byte-for-byte check against the PC-1600 keystroke typer.
 int run_pc1600_basicloader_tests();
-// Defined in basic_program_source_tests.cpp -- readBasicProgramSource:
-// .bas-vs-tokenized dispatch + libsharpdx tokenize-on-load.
+// Defined in basic_program_source_tests.cpp -- readBasicProgram: listing
+// or tokenized file, libsharpdx tokenize-on-load.
 int run_basic_program_source_tests();
 // Defined in pc1600_program_placement_tests.cpp -- the scattered-bank
 // segment-list + placement logic for the fast BASIC loader.
 int run_pc1600_program_placement_tests();
-// Defined in pc1600_machine_image_tests.cpp -- the 16-byte PC-1600
-// machine-language transfer-header parser (Core/PC1600/PC1600MachineImage).
-int run_pc1600_machine_image_tests();
 // Defined in key_paste_tests.cpp -- the GUI's clipboard-paste feeder.
 int run_key_paste_tests();
 // Defined in lcd_screenshot_tests.cpp -- LCD PNG render + `screenshot:` step.
@@ -1416,6 +1416,12 @@ int run_lcd_screenshot_tests();
 // Defined in machine_code_file_tests.cpp -- "Load Machine Code…": header
 // recognition, load plan, NEW/CALL advice, and the two writers.
 int run_machine_code_file_tests();
+// Defined in program_file_tests.cpp -- what a program file is (libsharpdx).
+int run_program_file_tests();
+int run_disasm_tests();
+int run_debug_target_tests();
+int run_listing_tests();
+int run_run_control_tests();
 
 int main() {
     test_reset_vector();
@@ -1497,20 +1503,25 @@ int main() {
     int pc1600PresetFailures = run_pc1600_preset_tests();
     int ce1600pFailures = run_ce1600p_tests();
     int ce1600fFailures = run_ce1600f_tests();
+    int hostDirectoryDriveFailures = run_host_directory_drive_tests();
+    int pc1600HostDriveFailures = run_pc1600_host_drive_tests();
     int ce150Failures = run_ce150_tests();
     int pc1600Ce150Failures = run_pc1600_ce150_tests();
     int ce158Failures = run_ce158_tests();
-    int basicBinaryImageFailures = run_basic_binary_image_tests();
     int basicFastLoaderFailures = run_basic_fastloader_tests();
     int pc1600BasicLoaderFailures = run_pc1600_basicloader_tests();
     int basicProgramSourceFailures = run_basic_program_source_tests();
     int pc1600ProgramPlacementFailures = run_pc1600_program_placement_tests();
-    int pc1600MachineImageFailures = run_pc1600_machine_image_tests();
     int piezoSamplerFailures = run_piezo_sampler_tests();
     int keyPasteFailures = run_key_paste_tests();
     int lcdScreenshotFailures = run_lcd_screenshot_tests();
     int machineCodeFileFailures = run_machine_code_file_tests();
-    return (g_fail == 0 && machineCodeFileFailures == 0 && piezoSamplerFailures == 0 && keyPasteFailures == 0 && lcdScreenshotFailures == 0 && basicBinaryImageFailures == 0 && basicFastLoaderFailures == 0 && pc1600BasicLoaderFailures == 0 && basicProgramSourceFailures == 0 && pc1600ProgramPlacementFailures == 0 && pc1600MachineImageFailures == 0 && connectorFailures == 0 && ce155Failures == 0 && ce1638Failures == 0 && ce502bFailures == 0 &&
+    int programFileFailures = run_program_file_tests();
+    int disasmFailures = run_disasm_tests();
+    int debugTargetFailures = run_debug_target_tests();
+    int listingFailures = run_listing_tests();
+    int runControlFailures = run_run_control_tests();
+    return (g_fail == 0 && machineCodeFileFailures == 0 && programFileFailures == 0 && disasmFailures == 0 && debugTargetFailures == 0 && listingFailures == 0 && runControlFailures == 0 && piezoSamplerFailures == 0 && keyPasteFailures == 0 && lcdScreenshotFailures == 0 && basicFastLoaderFailures == 0 && pc1600BasicLoaderFailures == 0 && basicProgramSourceFailures == 0 && pc1600ProgramPlacementFailures == 0 && connectorFailures == 0 && ce155Failures == 0 && ce1638Failures == 0 && ce502bFailures == 0 &&
             ce163fFailures == 0 && memoryCardFailures == 0 && batteryCardInstanceFailures == 0 &&
             presetFailures == 0 &&
             basicTyperFailures == 0 && pc1600BasicTyperFailures == 0 &&
@@ -1519,7 +1530,7 @@ int main() {
             lh5803Failures == 0 && pc1600MachineFailures == 0 && pc1600Phase54Failures == 0 &&
             pc1600KeyboardDisplayFailures == 0 && pc1600SlotRamFailures == 0 &&
             pc1600SlotModuleFailures == 0 && pc1600PresetFailures == 0 && ce1600pFailures == 0 &&
-            ce1600fFailures == 0 &&
+            ce1600fFailures == 0 && hostDirectoryDriveFailures == 0 && pc1600HostDriveFailures == 0 &&
             ce150Failures == 0 && pc1600Ce150Failures == 0 && ce158Failures == 0)
                ? 0
                : 1;

@@ -31,6 +31,10 @@ void SC7852::reset() {
     m_nmiPending = false;
     m_eiShadow = false;
     m_pendingPrefix = 0;
+    m_history.clear();
+    m_breakpoints.clearHit();
+    m_skipBreakpointAt = -1;
+    m_historyFrame = &m_history.next();
     // A/F and the general-purpose registers are left as their construction-
     // time values on a real Z-80 reset (undefined/whatever they were) —
     // this core initializes them to 0xFF/0 at construction and never
@@ -43,18 +47,25 @@ void SC7852::reset() {
 
 // R counts M1 cycles only (opcode and prefix fetches, interrupt
 // acknowledges), not operand or displacement reads.
+uint8_t SC7852::readCode() {
+    uint8_t v = bus.readMem(PC++);
+    m_historyFrame->bytes[m_fetchLen & 3] = v; // at most 4 per instruction; never overruns
+    m_fetchLen++;
+    return v;
+}
+
 uint8_t SC7852::fetchOpcode() {
     bumpR();
-    return bus.readMem(PC++);
+    return readCode();
 }
 
 uint8_t SC7852::fetch8() {
-    return bus.readMem(PC++);
+    return readCode();
 }
 
 uint16_t SC7852::fetch16() {
-    uint8_t lo = bus.readMem(PC++);
-    uint8_t hi = bus.readMem(PC++);
+    uint8_t lo = readCode();
+    uint8_t hi = readCode();
     return uint16_t(lo | (hi << 8));
 }
 
@@ -302,13 +313,13 @@ uint8_t SC7852::srl(uint8_t v) {
 // ── Stack ──────────────────────────────────────────────────────────────
 
 void SC7852::pushWord(uint16_t v) {
-    bus.writeMem(uint16_t(SP - 1), uint8_t(v >> 8));
-    bus.writeMem(uint16_t(SP - 2), uint8_t(v));
+    dataWrite(uint16_t(SP - 1), uint8_t(v >> 8));
+    dataWrite(uint16_t(SP - 2), uint8_t(v));
     SP = uint16_t(SP - 2);
 }
 uint16_t SC7852::popWord() {
-    uint8_t lo = bus.readMem(SP);
-    uint8_t hi = bus.readMem(uint16_t(SP + 1));
+    uint8_t lo = dataRead(SP);
+    uint8_t hi = dataRead(uint16_t(SP + 1));
     SP = uint16_t(SP + 2);
     return uint16_t(lo | (hi << 8));
 }
@@ -323,7 +334,7 @@ uint8_t SC7852::readReg8(int code) {
         case 3: return E;
         case 4: return H;
         case 5: return L;
-        case 6: return bus.readMem(hl());
+        case 6: return dataRead(hl());
         default: return A;
     }
 }
@@ -335,7 +346,7 @@ void SC7852::writeReg8(int code, uint8_t v) {
         case 3: E = v; break;
         case 4: H = v; break;
         case 5: L = v; break;
-        case 6: bus.writeMem(hl(), v); break;
+        case 6: dataWrite(hl(), v); break;
         default: A = v; break;
     }
 }
@@ -389,7 +400,7 @@ bool SC7852::condTrue(int code) const {
 
 void SC7852::requestNMI() { m_nmiPending = true; }
 
-int SC7852::serviceInterrupt(bool maskableBlocked) {
+int SC7852::serviceInterrupt(bool takeInt) {
     if (m_nmiPending) {
         m_nmiPending = false;
         bumpR(); // the acknowledge is an M1 cycle
@@ -400,7 +411,7 @@ int SC7852::serviceInterrupt(bool maskableBlocked) {
         PC = 0x0066;
         return 11 + kM1WaitStates;
     }
-    if (m_intLine && IFF1 && !maskableBlocked) {
+    if (takeInt) {
         bumpR();
         m_halted = false;
         IFF1 = false;
@@ -420,8 +431,8 @@ int SC7852::serviceInterrupt(bool maskableBlocked) {
             default: { // IM2: vector = (I<<8)|m_im2VectorLow, points at a
                        // 16-bit jump-table entry in memory
                 uint16_t vecAddr = uint16_t(uint16_t(I) << 8) | m_im2VectorLow;
-                uint8_t lo = bus.readMem(vecAddr);
-                uint8_t hi = bus.readMem(uint16_t(vecAddr + 1));
+                uint8_t lo = dataRead(vecAddr);
+                uint8_t hi = dataRead(uint16_t(vecAddr + 1));
                 pushWord(PC);
                 PC = uint16_t(lo | (hi << 8));
                 cost = 19;
@@ -445,17 +456,34 @@ int SC7852::step() {
     const bool eiShadow = m_eiShadow;
     m_eiShadow = false;
     // No interrupt is accepted between a DD/FD prefix and what follows it.
-    if (!m_pendingPrefix && (m_nmiPending || (m_intLine && IFF1 && !eiShadow))) {
-        int serviced = serviceInterrupt(eiShadow);
-        if (serviced >= 0) return serviced; // interrupt ack consumes this step() call on its own; no trace frame
+    // The INT level is only asked for when IFF1 could accept it.
+    const bool takeInt = !m_pendingPrefix && IFF1 && !eiShadow && bus.interruptLevel();
+    if (!m_pendingPrefix && (m_nmiPending || takeInt)) {
+        const uint16_t interruptedPC = PC;
+        int serviced = serviceInterrupt(takeInt);
+        if (serviced >= 0) { // interrupt ack consumes this step() call on its own; no trace frame
+            recordHistory(interruptedPC, true);
+            return serviced;
+        }
     }
     if (m_halted) {
         return 0;
     }
 
     uint32_t tf = traceFlags();
+    if (m_breakpointsEnabled && !m_pendingPrefix) {
+        if (m_skipBreakpointAt == PC) m_skipBreakpointAt = -1;
+        else if (m_breakpoints.check(PC)) {
+            // Parked, nothing executed: an EI just before still shields
+            // this instruction from a pending INT when it does run.
+            m_eiShadow = eiShadow;
+            return 0;
+        }
+    }
 
     uint16_t pcAtStart = m_pendingPrefix ? uint16_t(PC - 1) : PC; // a carried prefix starts the instruction
+    m_fetchLen = 0;
+    if (m_pendingPrefix) { m_historyFrame->bytes[0] = m_pendingPrefix; m_fetchLen = 1; }
     uint8_t opcode = m_pendingPrefix ? m_pendingPrefix : fetchOpcode();
     m_pendingPrefix = 0;
     int cycles = 0;
@@ -465,17 +493,25 @@ int SC7852::step() {
     // A following DD/FD (already fetched) is carried into the next step(),
     // keeping each step() bounded however long a prefix run is.
     uint8_t indexedOp = 0;
+    uint16_t histPc = pcAtStart;
     if (opcode == 0xDD || opcode == 0xFD) {
         indexedOp = fetchOpcode();
         if (indexedOp == 0xDD || indexedOp == 0xFD) {
             m_pendingPrefix = indexedOp;
             cycles = 4 + kM1WaitStates;
             recordTraceFrame(tf, pcAtStart, opcode, uint8_t(cycles));
+            m_fetchLen = 1; // the carried prefix belongs to the next frame
+            recordHistory(pcAtStart, false);
             return cycles;
         }
         if (indexedOp == 0xED) {
             cycles += 4 + kM1WaitStates;
             opcode = 0xED;
+            // The history frame keeps only the ED instruction (at most four
+            // bytes); the ignored prefix is dropped from it.
+            histPc = uint16_t(histPc + 1);
+            m_historyFrame->bytes[0] = 0xED;
+            m_fetchLen = 1;
         }
     }
     uint16_t opcodeWord = opcode;
@@ -491,6 +527,7 @@ int SC7852::step() {
     }
 
     recordTraceFrame(tf, pcAtStart, opcodeWord, uint8_t(cycles));
+    recordHistory(histPc, false);
     return cycles;
 }
 
@@ -529,7 +566,7 @@ int SC7852::execute(uint8_t opcode) {
     switch (opcode) {
         case 0x00: return 4; // NOP
         case 0x01: writeReg16_sp(0, fetch16()); return 10;
-        case 0x02: bus.writeMem(uint16_t(B << 8) | C, A); return 7;
+        case 0x02: dataWrite(uint16_t(B << 8) | C, A); return 7;
         case 0x03: writeReg16_sp(0, uint16_t(readReg16_sp(0) + 1)); return 6;
         case 0x04: B = inc8(B); return 4;
         case 0x05: B = dec8(B); return 4;
@@ -543,7 +580,7 @@ int SC7852::execute(uint8_t opcode) {
         }
         case 0x08: { uint8_t ta=A,tf=F; A=A2; F=F2; A2=ta; F2=tf; return 4; } // EX AF,AF'
         case 0x09: setHL(addHL16(hl(), readReg16_sp(0))); return 11;
-        case 0x0A: A = bus.readMem(uint16_t(B << 8) | C); return 7;
+        case 0x0A: A = dataRead(uint16_t(B << 8) | C); return 7;
         case 0x0B: writeReg16_sp(0, uint16_t(readReg16_sp(0) - 1)); return 6;
         case 0x0C: C = inc8(C); return 4;
         case 0x0D: C = dec8(C); return 4;
@@ -563,7 +600,7 @@ int SC7852::execute(uint8_t opcode) {
             return 8;
         }
         case 0x11: writeReg16_sp(1, fetch16()); return 10;
-        case 0x12: bus.writeMem(uint16_t(D << 8) | E, A); return 7;
+        case 0x12: dataWrite(uint16_t(D << 8) | E, A); return 7;
         case 0x13: writeReg16_sp(1, uint16_t(readReg16_sp(1) + 1)); return 6;
         case 0x14: D = inc8(D); return 4;
         case 0x15: D = dec8(D); return 4;
@@ -578,7 +615,7 @@ int SC7852::execute(uint8_t opcode) {
         }
         case 0x18: { int8_t e = int8_t(fetch8()); PC = uint16_t(PC + e); return 12; }
         case 0x19: setHL(addHL16(hl(), readReg16_sp(1))); return 11;
-        case 0x1A: A = bus.readMem(uint16_t(D << 8) | E); return 7;
+        case 0x1A: A = dataRead(uint16_t(D << 8) | E); return 7;
         case 0x1B: writeReg16_sp(1, uint16_t(readReg16_sp(1) - 1)); return 6;
         case 0x1C: E = inc8(E); return 4;
         case 0x1D: E = dec8(E); return 4;
@@ -594,7 +631,7 @@ int SC7852::execute(uint8_t opcode) {
 
         case 0x20: { int8_t e = int8_t(fetch8()); if (!(F & kFlagZ)) { PC = uint16_t(PC + e); return 12; } return 7; }
         case 0x21: setHL(fetch16()); return 10;
-        case 0x22: { uint16_t nn = fetch16(); bus.writeMem(nn, L); bus.writeMem(uint16_t(nn+1), H); return 16; }
+        case 0x22: { uint16_t nn = fetch16(); dataWrite(nn, L); dataWrite(uint16_t(nn+1), H); return 16; }
         case 0x23: setHL(uint16_t(hl() + 1)); return 6;
         case 0x24: H = inc8(H); return 4;
         case 0x25: H = dec8(H); return 4;
@@ -602,7 +639,7 @@ int SC7852::execute(uint8_t opcode) {
         case 0x27: daa(); return 4;
         case 0x28: { int8_t e = int8_t(fetch8()); if (F & kFlagZ) { PC = uint16_t(PC + e); return 12; } return 7; }
         case 0x29: setHL(addHL16(hl(), hl())); return 11;
-        case 0x2A: { uint16_t nn = fetch16(); L = bus.readMem(nn); H = bus.readMem(uint16_t(nn+1)); return 16; }
+        case 0x2A: { uint16_t nn = fetch16(); L = dataRead(nn); H = dataRead(uint16_t(nn+1)); return 16; }
         case 0x2B: setHL(uint16_t(hl() - 1)); return 6;
         case 0x2C: L = inc8(L); return 4;
         case 0x2D: L = dec8(L); return 4;
@@ -612,16 +649,16 @@ int SC7852::execute(uint8_t opcode) {
 
         case 0x30: { int8_t e = int8_t(fetch8()); if (!(F & kFlagC)) { PC = uint16_t(PC + e); return 12; } return 7; }
         case 0x31: SP = fetch16(); return 10;
-        case 0x32: { uint16_t nn = fetch16(); bus.writeMem(nn, A); return 13; }
+        case 0x32: { uint16_t nn = fetch16(); dataWrite(nn, A); return 13; }
         case 0x33: SP = uint16_t(SP + 1); return 6;
-        case 0x34: { uint8_t v = bus.readMem(hl()); bus.writeMem(hl(), inc8(v)); return 11; }
-        case 0x35: { uint8_t v = bus.readMem(hl()); bus.writeMem(hl(), dec8(v)); return 11; }
-        case 0x36: bus.writeMem(hl(), fetch8()); return 10;
+        case 0x34: { uint8_t v = dataRead(hl()); dataWrite(hl(), inc8(v)); return 11; }
+        case 0x35: { uint8_t v = dataRead(hl()); dataWrite(hl(), dec8(v)); return 11; }
+        case 0x36: dataWrite(hl(), fetch8()); return 10;
         case 0x37: setFlagBit(kFlagH, false); setFlagBit(kFlagN, false); setFlagBit(kFlagC, true);
                    setFlagBit(kFlagY,(A&kFlagY)!=0); setFlagBit(kFlagX,(A&kFlagX)!=0); return 4; // SCF
         case 0x38: { int8_t e = int8_t(fetch8()); if (F & kFlagC) { PC = uint16_t(PC + e); return 12; } return 7; }
         case 0x39: setHL(addHL16(hl(), SP)); return 11;
-        case 0x3A: { uint16_t nn = fetch16(); A = bus.readMem(nn); return 13; }
+        case 0x3A: { uint16_t nn = fetch16(); A = dataRead(nn); return 13; }
         case 0x3B: SP = uint16_t(SP - 1); return 6;
         case 0x3C: A = inc8(A); return 4;
         case 0x3D: A = dec8(A); return 4;
@@ -668,8 +705,8 @@ int SC7852::execute(uint8_t opcode) {
         case 0xE0: if (condTrue(4)) { PC = popWord(); return 11; } return 5;
         case 0xE1: setHL(popWord()); return 10;
         case 0xE2: { uint16_t nn = fetch16(); if (condTrue(4)) PC = nn; return 10; }
-        case 0xE3: { uint16_t tmp = bus.readMem(SP) | (uint16_t(bus.readMem(uint16_t(SP+1))) << 8);
-                     bus.writeMem(SP, L); bus.writeMem(uint16_t(SP+1), H);
+        case 0xE3: { uint16_t tmp = dataRead(SP) | (uint16_t(dataRead(uint16_t(SP+1))) << 8);
+                     dataWrite(SP, L); dataWrite(uint16_t(SP+1), H);
                      setHL(tmp); return 19; } // EX (SP),HL
         case 0xE4: { uint16_t nn = fetch16(); if (condTrue(4)) { pushWord(PC); PC = nn; return 17; } return 10; }
         case 0xE5: pushWord(hl()); return 11;
@@ -789,14 +826,14 @@ int SC7852::executeED(uint8_t opcode) {
         case 0x7A: setHL(adc16(hl(), SP)); return 11;
 
         // LD (nn),rr / LD rr,(nn)
-        case 0x43: { uint16_t nn = fetch16(); uint16_t v = readReg16_sp(0); bus.writeMem(nn, uint8_t(v)); bus.writeMem(uint16_t(nn+1), uint8_t(v>>8)); return 16; }
-        case 0x53: { uint16_t nn = fetch16(); uint16_t v = readReg16_sp(1); bus.writeMem(nn, uint8_t(v)); bus.writeMem(uint16_t(nn+1), uint8_t(v>>8)); return 16; }
-        case 0x63: { uint16_t nn = fetch16(); uint16_t v = hl(); bus.writeMem(nn, uint8_t(v)); bus.writeMem(uint16_t(nn+1), uint8_t(v>>8)); return 16; }
-        case 0x73: { uint16_t nn = fetch16(); bus.writeMem(nn, uint8_t(SP)); bus.writeMem(uint16_t(nn+1), uint8_t(SP>>8)); return 16; }
-        case 0x4B: { uint16_t nn = fetch16(); uint8_t lo=bus.readMem(nn), hi=bus.readMem(uint16_t(nn+1)); writeReg16_sp(0, uint16_t(lo|(hi<<8))); return 16; }
-        case 0x5B: { uint16_t nn = fetch16(); uint8_t lo=bus.readMem(nn), hi=bus.readMem(uint16_t(nn+1)); writeReg16_sp(1, uint16_t(lo|(hi<<8))); return 16; }
-        case 0x6B: { uint16_t nn = fetch16(); uint8_t lo=bus.readMem(nn), hi=bus.readMem(uint16_t(nn+1)); setHL(uint16_t(lo|(hi<<8))); return 16; }
-        case 0x7B: { uint16_t nn = fetch16(); uint8_t lo=bus.readMem(nn), hi=bus.readMem(uint16_t(nn+1)); SP = uint16_t(lo|(hi<<8)); return 16; }
+        case 0x43: { uint16_t nn = fetch16(); uint16_t v = readReg16_sp(0); dataWrite(nn, uint8_t(v)); dataWrite(uint16_t(nn+1), uint8_t(v>>8)); return 16; }
+        case 0x53: { uint16_t nn = fetch16(); uint16_t v = readReg16_sp(1); dataWrite(nn, uint8_t(v)); dataWrite(uint16_t(nn+1), uint8_t(v>>8)); return 16; }
+        case 0x63: { uint16_t nn = fetch16(); uint16_t v = hl(); dataWrite(nn, uint8_t(v)); dataWrite(uint16_t(nn+1), uint8_t(v>>8)); return 16; }
+        case 0x73: { uint16_t nn = fetch16(); dataWrite(nn, uint8_t(SP)); dataWrite(uint16_t(nn+1), uint8_t(SP>>8)); return 16; }
+        case 0x4B: { uint16_t nn = fetch16(); uint8_t lo=dataRead(nn), hi=dataRead(uint16_t(nn+1)); writeReg16_sp(0, uint16_t(lo|(hi<<8))); return 16; }
+        case 0x5B: { uint16_t nn = fetch16(); uint8_t lo=dataRead(nn), hi=dataRead(uint16_t(nn+1)); writeReg16_sp(1, uint16_t(lo|(hi<<8))); return 16; }
+        case 0x6B: { uint16_t nn = fetch16(); uint8_t lo=dataRead(nn), hi=dataRead(uint16_t(nn+1)); setHL(uint16_t(lo|(hi<<8))); return 16; }
+        case 0x7B: { uint16_t nn = fetch16(); uint8_t lo=dataRead(nn), hi=dataRead(uint16_t(nn+1)); SP = uint16_t(lo|(hi<<8)); return 16; }
 
         case 0x44: case 0x4C: case 0x54: case 0x5C:
         case 0x64: case 0x6C: case 0x74: case 0x7C: { // NEG
@@ -820,26 +857,26 @@ int SC7852::executeED(uint8_t opcode) {
         case 0x5F: A = R; setSZ53(A); setFlagBit(kFlagH,false); setFlagBit(kFlagN,false); setFlagBit(kFlagPV, IFF2); return 5;
 
         case 0x67: { // RRD
-            uint8_t mem = bus.readMem(hl());
+            uint8_t mem = dataRead(hl());
             uint8_t newMem = uint8_t(((A & 0x0F) << 4) | (mem >> 4));
             A = uint8_t((A & 0xF0) | (mem & 0x0F));
-            bus.writeMem(hl(), newMem);
+            dataWrite(hl(), newMem);
             setSZP53(A); setFlagBit(kFlagH,false); setFlagBit(kFlagN,false);
             return 14;
         }
         case 0x6F: { // RLD
-            uint8_t mem = bus.readMem(hl());
+            uint8_t mem = dataRead(hl());
             uint8_t newMem = uint8_t(((mem & 0x0F) << 4) | (A & 0x0F));
             A = uint8_t((A & 0xF0) | (mem >> 4));
-            bus.writeMem(hl(), newMem);
+            dataWrite(hl(), newMem);
             setSZP53(A); setFlagBit(kFlagH,false); setFlagBit(kFlagN,false);
             return 14;
         }
 
         // Block instructions
         case 0xA0: case 0xB0: { // LDI / LDIR
-            uint8_t v = bus.readMem(hl());
-            bus.writeMem(uint16_t(D<<8)|E, v);
+            uint8_t v = dataRead(hl());
+            dataWrite(uint16_t(D<<8)|E, v);
             setHL(uint16_t(hl()+1));
             uint16_t de = uint16_t((D<<8)|E); de = uint16_t(de+1); D=uint8_t(de>>8); E=uint8_t(de);
             uint16_t bcv = uint16_t((B<<8)|C); bcv = uint16_t(bcv-1); B=uint8_t(bcv>>8); C=uint8_t(bcv);
@@ -850,8 +887,8 @@ int SC7852::executeED(uint8_t opcode) {
             return 12;
         }
         case 0xA8: case 0xB8: { // LDD / LDDR
-            uint8_t v = bus.readMem(hl());
-            bus.writeMem(uint16_t(D<<8)|E, v);
+            uint8_t v = dataRead(hl());
+            dataWrite(uint16_t(D<<8)|E, v);
             setHL(uint16_t(hl()-1));
             uint16_t de = uint16_t((D<<8)|E); de = uint16_t(de-1); D=uint8_t(de>>8); E=uint8_t(de);
             uint16_t bcv = uint16_t((B<<8)|C); bcv = uint16_t(bcv-1); B=uint8_t(bcv>>8); C=uint8_t(bcv);
@@ -862,7 +899,7 @@ int SC7852::executeED(uint8_t opcode) {
             return 12;
         }
         case 0xA1: case 0xB1: { // CPI / CPIR
-            uint8_t v = bus.readMem(hl());
+            uint8_t v = dataRead(hl());
             uint8_t result = uint8_t(A - v);
             bool halfCarry = (A & 0x0F) < (v & 0x0F);
             setHL(uint16_t(hl()+1));
@@ -877,7 +914,7 @@ int SC7852::executeED(uint8_t opcode) {
             return 12;
         }
         case 0xA9: case 0xB9: { // CPD / CPDR
-            uint8_t v = bus.readMem(hl());
+            uint8_t v = dataRead(hl());
             uint8_t result = uint8_t(A - v);
             bool halfCarry = (A & 0x0F) < (v & 0x0F);
             setHL(uint16_t(hl()-1));
@@ -893,7 +930,7 @@ int SC7852::executeED(uint8_t opcode) {
         }
         case 0xA2: case 0xB2: { // INI / INIR
             uint8_t v = bus.readIO(C);
-            bus.writeMem(hl(), v);
+            dataWrite(hl(), v);
             setHL(uint16_t(hl()+1));
             B = uint8_t(B - 1);
             setFlagBit(kFlagZ, B == 0);
@@ -903,7 +940,7 @@ int SC7852::executeED(uint8_t opcode) {
         }
         case 0xAA: case 0xBA: { // IND / INDR
             uint8_t v = bus.readIO(C);
-            bus.writeMem(hl(), v);
+            dataWrite(hl(), v);
             setHL(uint16_t(hl()-1));
             B = uint8_t(B - 1);
             setFlagBit(kFlagZ, B == 0);
@@ -912,7 +949,7 @@ int SC7852::executeED(uint8_t opcode) {
             return 12;
         }
         case 0xA3: case 0xB3: { // OUTI / OTIR
-            uint8_t v = bus.readMem(hl());
+            uint8_t v = dataRead(hl());
             B = uint8_t(B - 1);
             bus.writeIO(C, v);
             setHL(uint16_t(hl()+1));
@@ -922,7 +959,7 @@ int SC7852::executeED(uint8_t opcode) {
             return 12;
         }
         case 0xAB: case 0xBB: { // OUTD / OTDR
-            uint8_t v = bus.readMem(hl());
+            uint8_t v = dataRead(hl());
             B = uint8_t(B - 1);
             bus.writeIO(C, v);
             setHL(uint16_t(hl()-1));
@@ -959,14 +996,14 @@ int SC7852::executeDDFD(uint8_t opcode, uint16_t& ixy) {
         case 0x29: ixy = addHL16(ixy, ixy); return 11;
         case 0x39: ixy = addHL16(ixy, SP); return 11;
         case 0x21: ixy = fetch16(); return 10;
-        case 0x22: { uint16_t nn=fetch16(); bus.writeMem(nn, uint8_t(ixy)); bus.writeMem(uint16_t(nn+1), uint8_t(ixy>>8)); return 16; }
-        case 0x2A: { uint16_t nn=fetch16(); uint8_t lo=bus.readMem(nn), hi=bus.readMem(uint16_t(nn+1)); ixy = uint16_t(lo|(hi<<8)); return 16; }
+        case 0x22: { uint16_t nn=fetch16(); dataWrite(nn, uint8_t(ixy)); dataWrite(uint16_t(nn+1), uint8_t(ixy>>8)); return 16; }
+        case 0x2A: { uint16_t nn=fetch16(); uint8_t lo=dataRead(nn), hi=dataRead(uint16_t(nn+1)); ixy = uint16_t(lo|(hi<<8)); return 16; }
         case 0x23: ixy = uint16_t(ixy+1); return 6;
         case 0x2B: ixy = uint16_t(ixy-1); return 6;
         case 0xE1: ixy = popWord(); return 10;
         case 0xE5: pushWord(ixy); return 11;
-        case 0xE3: { uint16_t tmp = uint16_t(bus.readMem(SP) | (uint16_t(bus.readMem(uint16_t(SP+1)))<<8));
-                     bus.writeMem(SP, uint8_t(ixy)); bus.writeMem(uint16_t(SP+1), uint8_t(ixy>>8));
+        case 0xE3: { uint16_t tmp = uint16_t(dataRead(SP) | (uint16_t(dataRead(uint16_t(SP+1)))<<8));
+                     dataWrite(SP, uint8_t(ixy)); dataWrite(uint16_t(SP+1), uint8_t(ixy>>8));
                      ixy = tmp; return 19; }
         case 0xE9: PC = ixy; return 4;
         case 0xF9: SP = ixy; return 6;
@@ -976,9 +1013,9 @@ int SC7852::executeDDFD(uint8_t opcode, uint16_t& ixy) {
         case 0x2C: { uint8_t l=inc8(uint8_t(ixy)); ixy=uint16_t((ixy&0xFF00)|l); return 4; }
         case 0x2D: { uint8_t l=dec8(uint8_t(ixy)); ixy=uint16_t((ixy&0xFF00)|l); return 4; }
         case 0x2E: { uint8_t n=fetch8(); ixy=uint16_t((ixy&0xFF00)|n); return 7; }
-        case 0x34: { int8_t d=int8_t(fetch8()); uint16_t addr=uint16_t(ixy+d); uint8_t v=bus.readMem(addr); bus.writeMem(addr, inc8(v)); return 19; }
-        case 0x35: { int8_t d=int8_t(fetch8()); uint16_t addr=uint16_t(ixy+d); uint8_t v=bus.readMem(addr); bus.writeMem(addr, dec8(v)); return 19; }
-        case 0x36: { int8_t d=int8_t(fetch8()); uint8_t n=fetch8(); bus.writeMem(uint16_t(ixy+d), n); return 15; }
+        case 0x34: { int8_t d=int8_t(fetch8()); uint16_t addr=uint16_t(ixy+d); uint8_t v=dataRead(addr); dataWrite(addr, inc8(v)); return 19; }
+        case 0x35: { int8_t d=int8_t(fetch8()); uint16_t addr=uint16_t(ixy+d); uint8_t v=dataRead(addr); dataWrite(addr, dec8(v)); return 19; }
+        case 0x36: { int8_t d=int8_t(fetch8()); uint8_t n=fetch8(); dataWrite(uint16_t(ixy+d), n); return 15; }
         case 0xCB: { int8_t d=int8_t(fetch8()); uint8_t sub=fetch8(); return executeDDFDCB(sub, ixy, d); }
         default: break;
     }
@@ -989,12 +1026,12 @@ int SC7852::executeDDFD(uint8_t opcode, uint16_t& ixy) {
         int src = opcode & 0x07;
         if (dst == 6) {
             int8_t d = int8_t(fetch8());
-            bus.writeMem(uint16_t(ixy + d), readReg8(src)); // src stays plain H/L if 4/5
+            dataWrite(uint16_t(ixy + d), readReg8(src)); // src stays plain H/L if 4/5
             return 15;
         }
         if (src == 6) {
             int8_t d = int8_t(fetch8());
-            writeReg8(dst, bus.readMem(uint16_t(ixy + d))); // dst stays plain H/L if 4/5
+            writeReg8(dst, dataRead(uint16_t(ixy + d))); // dst stays plain H/L if 4/5
             return 15;
         }
         auto readSub = [&](int code) -> uint8_t {
@@ -1018,7 +1055,7 @@ int SC7852::executeDDFD(uint8_t opcode, uint16_t& ixy) {
         int cost;
         if (src == 6) {
             int8_t d = int8_t(fetch8());
-            operand = bus.readMem(uint16_t(ixy + d));
+            operand = dataRead(uint16_t(ixy + d));
             cost = 15;
         } else if (src == 4) {
             operand = uint8_t(ixy >> 8);
@@ -1060,7 +1097,7 @@ int SC7852::executeDDFDCB(uint8_t opcode, uint16_t ixy, int8_t d) {
     uint16_t addr = uint16_t(ixy + d);
     int group = (opcode >> 6) & 0x03;
     int mid = (opcode >> 3) & 0x07;
-    uint8_t v = bus.readMem(addr);
+    uint8_t v = dataRead(addr);
 
     if (group == 1) { // BIT n,(ixy+d)
         bool set = (v & (1 << mid)) != 0;
@@ -1090,15 +1127,13 @@ int SC7852::executeDDFDCB(uint8_t opcode, uint16_t ixy, int8_t d) {
     } else {
         result = uint8_t(v | (1 << mid));
     }
-    bus.writeMem(addr, result);
+    dataWrite(addr, result);
     return 19; // base cost; step() already charged the DD/FD prefix's 4 T-states
 }
 
 // ── Trace ─────────────────────────────────────────────────────────────
 
-void SC7852::recordTraceFrame(uint32_t tf, uint16_t pcAtStart, uint16_t opcodeWord, uint8_t cycles) {
-    if ((tf & (TRACE_PC | TRACE_REGS_LIGHT | TRACE_REGS_FULL)) == 0) return;
-
+void SC7852::pushTraceFrame(uint32_t tf, uint16_t pcAtStart, uint16_t opcodeWord, uint8_t cycles) {
     Z80CpuFrame f{};
     f.seqno = m_traceSeqno++;
     f.pc = pcAtStart;
@@ -1112,4 +1147,17 @@ void SC7852::recordTraceFrame(uint32_t tf, uint16_t pcAtStart, uint16_t opcodeWo
     }
 
     m_trace.push(f);
+}
+
+void SC7852::recordHistory(uint16_t pcAtStart, bool interrupt) {
+    Z80HistoryFrame& h = *m_historyFrame; // bytes[] already filled by readCode()
+    h.pc = pcAtStart;
+    h.len = interrupt ? 0 : m_fetchLen;
+    h.interrupt = interrupt;
+    h.af = af(); h.bc = bc(); h.de = de(); h.hl = hl();
+    h.af2 = af2(); h.bc2 = bc2(); h.de2 = de2(); h.hl2 = hl2();
+    h.ix = IX; h.iy = IY; h.sp = SP; h.pcAfter = PC;
+    h.i = I; h.r = R; h.im = IM; h.iff1 = IFF1; h.iff2 = IFF2;
+    m_history.commit();
+    m_historyFrame = &m_history.next();
 }

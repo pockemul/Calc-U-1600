@@ -1,5 +1,5 @@
 // Throw-away probe: trace the ROM path when BASIC runs an S2: RAM-disk
-// operation on a CE-1601M (see docs/PC1600-Core-Limitations.md's
+// operation on a CE-1601M (see docs/developer/PC1600-Core-Limitations.md's
 // bank-switching section for the required INIT order of operations).
 //
 // Boots the full dual-CPU PC1600Machine with a CE-1601M in Slot 2, runs to
@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
 
     // CE-1601M into Slot 2 (the RAM disk lives here).
     std::string err;
-    auto card = makeSoftwareDefinedCard("Calc-U-1600/Resources/ce1601m.card.yaml",
+    auto card = makeSoftwareDefinedCard("Qt6/resources/cards/ce1601m.card.yaml",
                                         CardHost::PC1600Slot2, &err);
     if (!card) {
         std::fprintf(stderr, "CE-1601M card build failed: %s\n", err.c_str());

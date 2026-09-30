@@ -45,7 +45,8 @@ inline void setInstanceDirOverride(const QString& dir) {
 //   Samples  -- "Load Preset…" (and Settings' default-preset pickers)
 //   Basic    -- "Load BASIC Program…" (.bas listings)
 //   Assembly -- "Load Machine Code…" (.bin files)
-enum class OpenFolder { Samples, Basic, Assembly };
+//   HostDrive -- "Mount Directory…" (PC-1600 host drive S3:)
+enum class OpenFolder { Samples, Basic, Assembly, HostDrive };
 
 // Key group per folder. Samples keeps the original "preset/" keys so a
 // folder configured before the split carries over.
@@ -54,6 +55,7 @@ inline QString openFolderKeyGroup(OpenFolder folder) {
         case OpenFolder::Samples: return QStringLiteral("preset/");
         case OpenFolder::Basic: return QStringLiteral("basic/");
         case OpenFolder::Assembly: return QStringLiteral("assembly/");
+        case OpenFolder::HostDrive: return QStringLiteral("hostDrive/");
     }
     return QStringLiteral("preset/");
 }
@@ -76,15 +78,19 @@ inline void setOpenDir(OpenFolder folder, const QString& dir) {
 }
 
 // Key: "<group>lastOpenDir" -- the folder of the file last picked in that
-// dialog. Recorded on every pick (rememberOpenFile()), but only used while
+// dialog (for HostDrive: the directory last mounted). Recorded on every
+// pick (rememberOpenFile() / rememberOpenDir()), but only used while
 // openDir() is unset.
 inline QString lastOpenDir(OpenFolder folder) {
     return backingStore().value(openFolderKeyGroup(folder) + QStringLiteral("lastOpenDir"), QString()).toString();
 }
 
+inline void rememberOpenDir(OpenFolder folder, const QString& dir) {
+    backingStore().setValue(openFolderKeyGroup(folder) + QStringLiteral("lastOpenDir"), QDir(dir).absolutePath());
+}
+
 inline void rememberOpenFile(OpenFolder folder, const QString& filePath) {
-    backingStore().setValue(openFolderKeyGroup(folder) + QStringLiteral("lastOpenDir"),
-                            QFileInfo(filePath).absolutePath());
+    rememberOpenDir(folder, QFileInfo(filePath).absolutePath());
 }
 
 // The start directory for that dialog: the fixed openDir() if set, else
@@ -135,6 +141,18 @@ inline int traceMaxFileSizeMB() {
 inline void setTraceMaxFileSizeMB(int mb) {
     backingStore().setValue(QStringLiteral("trace/maxFileSizeMB"), mb);
 }
+
+// Keys: "debug/dapEnabled" (default off) and "debug/dapPort" (default 32168)
+// -- the Debug Adapter Protocol server VS Code attaches to (see
+// debug/DebugController). It listens on 127.0.0.1 only.
+constexpr int kDefaultDapPort = 32168;
+inline bool dapEnabled() { return backingStore().value(QStringLiteral("debug/dapEnabled"), false).toBool(); }
+inline void setDapEnabled(bool on) { backingStore().setValue(QStringLiteral("debug/dapEnabled"), on); }
+inline int dapPort() {
+    const int port = backingStore().value(QStringLiteral("debug/dapPort"), kDefaultDapPort).toInt();
+    return port >= 1024 && port <= 65535 ? port : kDefaultDapPort;
+}
+inline void setDapPort(int port) { backingStore().setValue(QStringLiteral("debug/dapPort"), port); }
 
 // Key: "serial/linkDirectory" -- directory PtySerialLink creates its stable
 // `calcu1600.serial` symlink in. Empty/absent means AppPaths::instanceDir()

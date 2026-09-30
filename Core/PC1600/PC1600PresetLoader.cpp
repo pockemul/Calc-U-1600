@@ -1,12 +1,15 @@
+#include "../Preset/PresetBusRomLoader.hpp"
 #include "PC1600PresetLoader.hpp"
 
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "../Connector/FloppyImageFile.hpp"
+#include "../Preset/PresetInterface.hpp"
 #include "../Resources/BundledRomCatalog.hpp"
 #include "PC1600BasicLoader.hpp"
 #include "PC1600BasicTyper.hpp"
@@ -20,24 +23,14 @@ namespace {
 constexpr uint64_t kTStateHz = PC1600Machine::kTStateHz;
 constexpr uint64_t kFrameTStates = kTStateHz / 60;
 
-// ON (BREAK) hold/idle -- tapKey() (PC1600BasicTyper) drives the key
-// matrix, but ON isn't a matrix key, so this stays local.
+// ON (BREAK) hold, and the idle after it -- see presetTapOn().
 constexpr uint64_t kHoldTStates = kFrameTStates * 4;
-constexpr uint64_t kIdleTStates = kFrameTStates * 4;
 
 // The console input line, as ASCII, at the PC-1600 work-area buffer
 // FBB0H-FBFFH (PC-1600-Work-Area-Map.md; the same window
 // pc1600_preset_tests.cpp reads). Logged after each step so a stuck load
 // can be lined up against the LCD's edit line.
-std::string screenText(PC1600Machine& machine) {
-    std::string s;
-    for (uint16_t a = 0xFBB0; a <= 0xFBFF; ++a) {
-        uint8_t b = machine.memory().peek(a);
-        if (b == 0x0D) break;
-        s += (b >= 0x20 && b < 0x7F) ? static_cast<char>(b) : '.';
-    }
-    return s;
-}
+std::string screenText(PC1600Machine& machine) { return presetInputLine(machine, 0xFBB0); }
 
 std::string stepTag(PC1600Machine& machine) {
     // Whichever CPU currently owns the bus -- the LH5803 (BASIC-compat)
@@ -50,51 +43,88 @@ std::string stepTag(PC1600Machine& machine) {
     return "  screen=\"" + screenText(machine) + "\"" + pc;
 }
 
-void tapBreak(PC1600Machine& machine) {
-    machine.setOnKeyPressed(true);
-    machine.runCycles(kHoldTStates);
-    machine.setOnKeyPressed(false);
-    machine.runCycles(kIdleTStates);
-}
-
 // Attach the plotter the preset's `plotter:` asks for, before the cold
 // boot below so the boot ROM detects it -- and, if `floppy:` named a saved
 // CE-1600F disk, resolve it by disk-name and load it into the union-attached
 // CE1600FCard (read and validated before attaching, so a bad file leaves no
 // plotter behind). `moduleDirs` is the same bundled-then-save-folder list
-// `- modulespec:` resolution searches. Returns false with result->error
+// `slot-N:` resolution searches. Returns false with result->error
 // set on any problem.
 bool attachPresetPlotter(PC1600Machine& machine, const std::string& plotter,
-                         const std::string& ce1600pRom, const std::string& floppy, int floppySide, const std::vector<std::string>& romDirs,
+                         const std::string& ce1600pRom, const std::string& floppy, const std::string& floppyFile,
+                         int floppySide, const std::vector<std::string>& romDirs,
                          const std::vector<std::string>& moduleDirs, const PresetLogFn& log,
                          PresetLoadResult* result) {
     if (plotter.empty()) return true;
 
     FloppyFile disk;
+    std::string diskLabel;
     if (!floppy.empty()) {
         std::string path, err;
         if (!resolveFloppyByName(moduleDirs, floppy, &path, &err) || !readFloppyFile(path, &disk, &err)) {
             result->error = "floppy: " + err;
             return false;
         }
+        diskLabel = floppy;
         result->floppyImageLabel = floppy;
         result->floppyResolvedPath = path;
+    } else if (!floppyFile.empty()) {
+        std::string err;
+        if (!readFloppyFile(floppyFile, &disk, &err)) {
+            result->error = "floppy-file: " + floppyFile + ": " + err;
+            return false;
+        }
+        diskLabel = disk.diskName;
+        result->floppyImageLabel = disk.diskName;
+        result->floppyResolvedPath = floppyFile;
     }
 
     if (!BundledRoms::attachPlotterByName(machine, plotter, romDirs, &result->error, &result->ce150Attached,
                                           ce1600pRom)) {
         return false;
     }
-    if (!floppy.empty()) {
+    if (!diskLabel.empty()) {
         machine.ce1600fLoadImage(disk.image.data(), disk.image.size());  // resets to side A
         if (floppySide != 0) machine.ce1600fSetSide(floppySide);
     }
     if (log) {
         log(plotter == "ce150" ? "plotter: CE-150 attached (LH5803 side)"
                                 : "plotter: " + plotter + (plotter == "ce1600p" ? ":" + ce1600pRom : "") + " attached" +
-                                      (floppy.empty() ? "" : " (floppy: " + floppy + ")"));
+                                      (diskLabel.empty() ? "" : " (floppy: " + diskLabel + ")"));
     }
     return true;
+}
+
+// `host-drive:` -- mount the directory as S3: / Y: before the cold boot,
+// so the ROM's module scan finds the drive (docs/PC1600-Host-Drive.md).
+bool attachPresetHostDrive(PC1600Machine& machine, const std::string& dir, const std::vector<std::string>& romDirs,
+                           const PresetLogFn& log, PresetLoadResult* result) {
+    if (dir.empty()) return true;
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) {
+        result->error = "host-drive: '" + dir + "' is not a directory";
+        return false;
+    }
+    std::string err;
+    if (!BundledRoms::attachHostDrive(machine, romDirs, dir, &err)) {
+        result->error = "host-drive: " + err;
+        return false;
+    }
+    if (log) log("host-drive: " + dir + " mounted as S3:");
+    return true;
+}
+
+// `bus-rom:` -- a `bank` ROM on the system bus, an `address` ROM on the
+// LH5803 side.
+bool attachPresetBusRoms(PC1600Machine& machine, const std::vector<PresetBusRom>& roms, const PresetLogFn& log,
+                         PresetLoadResult* result) {
+    return preset_bus_rom::attachAll(
+        roms,
+        [&](const PresetBusRom& rom, std::string* err) {
+            return rom.bank >= 0 ? preset_bus_rom::attach(machine, preset_bus_rom::makeSystemBusCard(rom, err))
+                                 : preset_bus_rom::attach(machine, preset_bus_rom::makeCard(rom, err));
+        },
+        log, &result->error);
 }
 
 class PC1600PresetMachine final : public PresetMachineBase<PC1600Machine> {
@@ -114,7 +144,7 @@ public:
         // is out of its key-scan loop for a bit. No-op without a plotter.
         waitForKeyboardScanLoop(m_machine);
         if (name == "break" || name == "on") {
-            tapBreak(m_machine);
+            presetTapOn(m_machine, kHoldTStates);
             return true;
         }
         if (PC1600Keyboard::keyFromName(name) == PC1600Keyboard::Key::Unknown) {
@@ -138,22 +168,19 @@ public:
     BasicTypeResult typeBasicProgram(const std::string& text) override {
         return typeBasicProgramText(m_machine, text);
     }
-    basic::TransferModel transferModel() const override { return basic::TransferModel::PC1600; }
-    BasicLoadResult loadBasicPayload(const std::vector<uint8_t>& payload) override {
-        return loadBasicBinaryPayload(m_machine, payload);
+    BasicLoadResult loadBasicFile(const std::string& path) override {
+        return loadBasicProgramFile(m_machine, path);
     }
 
     machinecode::Target codeTarget() const override { return machinecode::Target::PC1600; }
-    // Linear, into exactly the one slot the preset names: S0 = internal RAM
-    // ($C000-$FFFF), S1/S2 = the $8000-$BFFF memory-slot window. Straight
-    // into the backing store, so the current bank state doesn't matter and
-    // no ADTBL scatter applies (unlike the BASIC fast loader).
-    bool loadMachineCode(const PresetProgram& program, uint32_t addr, const uint8_t* data, size_t len,
+    machinecode::PC1600State codeState() override { return pc1600LoadState(m_machine); }
+    // Linear, into the slot planLoad() derived from MODE, TITLE and the
+    // address: S0 = internal RAM ($C000-$FFFF), S1/S2 = the $8000-$BFFF
+    // memory-slot window. Straight into the backing store, so the current
+    // bank state doesn't matter.
+    bool loadMachineCode(machinecode::Slot slot, uint32_t busAddr, const uint8_t* data, size_t len,
                          std::string* error) override {
-        const int slot = program.slot == PresetProgram::Slot::S1   ? 1
-                         : program.slot == PresetProgram::Slot::S2 ? 2
-                                                                   : 0;
-        return loadPC1600MachineCode(m_machine, slot, addr, data, len, error);
+        return loadPC1600MachineCode(m_machine, static_cast<int>(slot), busAddr, data, len, error);
     }
 };
 
@@ -178,7 +205,7 @@ PresetLoadResult applyPC1600Preset(PC1600Machine& machine, const PresetFile& pre
         std::unique_ptr<ExpansionCard> card =
             makePresetModuleCard(specFile, specName, moduleDirs, host, &specPath, &err);
         if (!card) {
-            result.error = "slot " + std::to_string(slot) + " modulespec: " + err;
+            result.error = "slot-" + std::to_string(slot) + ": " + err;
             return false;
         }
         const std::string label = card->moduleName() + " (" + specPath + ")";
@@ -193,32 +220,29 @@ PresetLoadResult applyPC1600Preset(PC1600Machine& machine, const PresetFile& pre
         return true;
     };
 
-    if (!plug(preset.slot1ModuleSpecFile, preset.slot1ModuleSpecName, 1))
-        return result;
-    if (!plug(preset.slot2ModuleSpecFile, preset.slot2ModuleSpecName, 2))
-        return result;
+    // Arm the machine -- modules, then (before the reset below, so the boot
+    // ROM's peripheral scan sees them, as on real hardware: power off,
+    // connect, power on) the plotter and the CE-158 next to (or instead of)
+    // the CE-150; the parser already refused the CE-158 with the CE-1600P.
+    // Stops at the first failure.
+    const bool armed = plug(preset.slot1ModuleSpecFile, preset.slot1ModuleSpecName, 1) &&
+                       plug(preset.slot2ModuleSpecFile, preset.slot2ModuleSpecName, 2) &&
+                       attachPresetPlotter(machine, preset.plotter, preset.ce1600pRomVariant, preset.floppy,
+                                           preset.floppyFile, preset.floppySide, romDirs, moduleDirs, log, &result) &&
+                       attachPresetInterface(machine, preset.interfaceName, romDirs, log, &result) &&
+                       attachPresetHostDrive(machine, preset.hostDrive, romDirs, log, &result) &&
+                       attachPresetBusRoms(machine, preset.busRoms, log, &result);
 
-    // Plotter (`plotter:`) -- attach before the reset below, so the boot
-    // ROM's peripheral scan sees it (mirrors real hardware: power off,
-    // connect, power on).
-    if (!attachPresetPlotter(machine, preset.plotter, preset.ce1600pRomVariant, preset.floppy,
-                             preset.floppySide, romDirs, moduleDirs, log, &result))
-        return result;
-    // The CE-158 next to (or instead of) the CE-150 -- the parser already
-    // refused it together with the CE-1600P.
-    if (preset.interfaceName == "ce158") {
-        if (!BundledRoms::attachCE158(machine, romDirs, &result.error)) {
-            if (log) log(result.error);
-            return result;
-        }
-        result.ce158Attached = true;
-        if (log) log("interface: CE-158 attached (LH5803 side)");
-    }
-
-    // Machine is now fully armed (model/cards/plotter wired) but still
-    // powered off -- give the caller a chance to repaint that state before
-    // the boot below makes it start running.
+    // Machine is now armed (model/cards/plotter wired) but still powered
+    // off -- give the caller a chance to repaint that state before the
+    // boot below makes it start running. Fired on a failed arming too, so
+    // the caller always sees what did get attached.
     if (onArmed) onArmed(result);
+    if (!armed) return result;
+    if (preset.armOnly) {
+        result.ok = true;
+        return result;
+    }
 
     // Full cold boot: the slot config just changed, so the IOCS work area
     // must be rebuilt from scratch (simple reset() would keep stale RAM).

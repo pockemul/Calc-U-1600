@@ -2,22 +2,25 @@
 //   * Core/Yaml.hpp                  -- the YAML-subset reader
 //   * Core/Connector/MemoryCardDefinition.hpp -- parse + validate + resolve
 //   * Core/Connector/SoftwareDefinedCard.hpp  -- the ExpansionCard itself
-//   * the `- modulespec:` preset hook and the OUT (28H) -> Slot 2 route
+//   * the `slot-N:` preset keys and the OUT (28H) -> Slot 2 route
 //
 // Same no-framework, assert-and-tally style as lh5801_tests.cpp.
 // Build & run: see tools/run_tests.sh
 //
 // The card-definition inputs here are inline strings, not the files under
-// examples/memory-cards/ (those are demo assets that get renamed/edited);
+// examples/memory/memory-cards/ (those are demo assets that get renamed/edited);
 // the one file-based test SKIPs if its example is absent.
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
+
+#include <unistd.h> // mkdtemp
 
 #include "../Connector/MemoryCardCatalog.hpp"
 #include "../Connector/MemoryCardDefinition.hpp"
@@ -695,6 +698,47 @@ void test_rom_needs_every_byte_covered() {
     CHECK(err.find("0x8") != std::string::npos);
 }
 
+// `encoding: file`: the bytes come from a sidecar next to the definition,
+// read when the definition is loaded -- a rebuilt ROM is picked up by the
+// next load.
+void test_rom_from_a_sidecar_file() {
+    char tmpl[] = "/tmp/card_file_XXXXXX";
+    const char* dir = mkdtemp(tmpl);
+    CHECK(dir != nullptr);
+    if (!dir) return;
+    const std::string d(dir);
+    const std::string yaml = std::string(kMinPrefix) +
+                             "  - name: r\n    capacity: 0x10\n    banking: none\n    content: rom\n"
+                             "    addressing: { chip-select: Y0, span: 0x10 }\n"
+                             "    initial-content:\n      blocks:\n        - offset: 0\n          encoding: file\n"
+                             "          path: build/rom.bin\n";
+    std::ofstream(d + "/rom.card.yaml") << yaml;
+    std::filesystem::create_directories(d + "/build");
+    const auto writeRom = [&](uint8_t first) {
+        std::string bytes(16, char(0xEE));
+        bytes[0] = char(first);
+        std::ofstream(d + "/build/rom.bin", std::ios::binary) << bytes;
+    };
+    PinState p;
+    p.pin[4] = true;
+    uint8_t v = 0;
+    writeRom(0x55);
+    std::string err;
+    auto card = makeSoftwareDefinedCard(d + "/rom.card.yaml", CardHost::PC1500, &err);
+    CHECK(card && card->respondsToRead(p, v) && v == 0x55);
+    writeRom(0x66);  // rebuilt: the next load has the new bytes
+    card = makeSoftwareDefinedCard(d + "/rom.card.yaml", CardHost::PC1500, &err);
+    CHECK(card && card->respondsToRead(p, v) && v == 0x66);
+
+    // Without the definition's own file there is nothing to be relative to.
+    MemoryCardDefinition def;
+    CHECK(!parseMemoryCardDefinition(yaml, &def, &err) && err.find("relative") != std::string::npos);
+    // A short file doesn't cover the ROM.
+    std::ofstream(d + "/build/rom.bin", std::ios::binary) << std::string(8, char(0xEE));
+    CHECK(!makeSoftwareDefinedCard(d + "/rom.card.yaml", CardHost::PC1500, &err));
+    std::filesystem::remove_all(d);
+}
+
 // ROM and RAM banks in one region: the ROM banks stay read-only, the RAM
 // bank takes writes, and the card isn't a ROM module as a whole.
 void test_rom_by_bank_mixed_with_regular() {
@@ -1298,28 +1342,25 @@ void test_reject_initial_content_missing_bank_on_banked_region() {
 std::string makeScratchCardDir();  // defined below, in the catalogue section
 
 void test_preset_parses_modulespec() {
-    // `modulespecfile:` -- a path, resolved relative to the preset dir.
+    // `slot-N-file:` -- a path, resolved relative to the preset dir.
     PresetFile preset;
     std::string err;
     CHECK(parsePresetString("model: PC-1500\n"
-                            "memory-expansion:\n"
-                            "  - modulespecfile: /abs/path/foo.card.yaml\n",
+                            "slot-1-file: /abs/path/foo.card.yaml\n",
                             "/tmp/memory_card_tests_scratch.pc1500", &preset, &err));
-    CHECK(preset.memoryExpansionModuleSpecFile == "/abs/path/foo.card.yaml");
-    CHECK(preset.memoryExpansionModuleSpecName.empty());
+    CHECK(preset.slot1ModuleSpecFile == "/abs/path/foo.card.yaml");
+    CHECK(preset.slot1ModuleSpecName.empty());
 
     PresetFile p2;
     CHECK(parsePresetString("model: PC-1600\n"
-                            "memory-expansion-2:\n"
-                            "  - modulespecfile: cards/x.card.yaml\n",
+                            "slot-2-file: cards/x.card.yaml\n",
                             "/tmp/memory_card_tests_scratch.pc1600", &p2, &err));
     CHECK(p2.slot2ModuleSpecFile == "/tmp/cards/x.card.yaml");  // relative to the scratch dir
 
-    // `modulespec:` -- a bundled module-name, stored verbatim (unresolved).
+    // `slot-N:` -- a bundled module-name, stored verbatim (unresolved).
     PresetFile p3;
     CHECK(parsePresetString("model: PC-1600\n"
-                            "memory-expansion-1:\n"
-                            "  - modulespec: CE-155\n",
+                            "slot-1: CE-155\n",
                             "/tmp/memory_card_tests_scratch3.pc1600", &p3, &err));
     CHECK(p3.slot1ModuleSpecName == "CE-155");
     CHECK(p3.slot1ModuleSpecFile.empty());
@@ -1329,15 +1370,14 @@ void test_preset_rejects_second_modulespec_item() {
     PresetFile preset;
     std::string err;
     CHECK(!parsePresetString("model: PC-1600\n"
-                             "memory-expansion-1:\n"
-                             "  - modulespec: CE-155\n"
+                             "slot-1: CE-155\n"
                              "  - modulespec: CE-155\n",
                              "/tmp/memory_card_tests_scratch2.pc1600", &preset, &err));
 }
 
 void test_ce1601m_end_to_end_through_pc1600() {
     // Drive a CE-1601M through a full preset load two ways -- a
-    // `modulespecfile:` path and a `modulespec:` module-name resolved from
+    // `slot-2-file:` path and a `slot-N:` module-name resolved from
     // a scratch module directory -- both exercising the OUT (28H) -> Slot 2
     // route. `run` asserts the vertical-bank behaviour for a loaded preset.
     auto run = [&](const PresetFile& preset, const std::string& moduleDir) {
@@ -1366,8 +1406,7 @@ void test_ce1601m_end_to_end_through_pc1600() {
     PresetFile byFile;
     std::string err;
     CHECK(parsePresetString(std::string("model: PC-1600\n"
-                                        "memory-expansion-2:\n"
-                                        "  - modulespecfile: ") +
+                                        "slot-2-file: ") +
                                 cardPath + "\n",
                             "/tmp/memory_card_tests_e2e.pc1600", &byFile, &err));
     CHECK(byFile.slot2ModuleSpecFile == cardPath);
@@ -1376,8 +1415,7 @@ void test_ce1601m_end_to_end_through_pc1600() {
     const std::string moduleDir = makeScratchCardDir();  // writes ce1601m.card.yaml (module-name CE-1601M)
     PresetFile byName;
     CHECK(parsePresetString("model: PC-1600\n"
-                            "memory-expansion-2:\n"
-                            "  - modulespec: CE-1601M\n",
+                            "slot-2: CE-1601M\n",
                             "/tmp/memory_card_tests_e2e_name.pc1600", &byName, &err));
     CHECK(byName.slot2ModuleSpecName == "CE-1601M");
     run(byName, moduleDir);
@@ -1451,6 +1489,28 @@ void test_ce1601m_slot2map_remap() {
     CHECK(mem.read(0x4000) == 0xFF);
     mem.writeIO(0x31, 0x01);              // page-A bank 1
     CHECK(mem.read(0x0000) == 0xFF);      // no ROM loaded -> open bus, not Slot 2
+}
+
+// contentRevision() moves only when the stored content changes: a guest
+// write of a new value, a debugImageWrite(); not a write of the value
+// already there (what the GUI's card autosave relies on to skip a copy).
+void test_card_content_revision() {
+    PC1600Bank bank;
+    PC1600Memory mem(bank);
+    CHECK(mem.slot1CardRevision() == 0); // empty slot
+    mem.attachSlot1Card(plainRamCard(0x8000));
+    mem.writeIO(0x31, 0 << 4); // page-C bank 0
+    mem.write(0x8000, 0x42);
+    const uint64_t r1 = mem.slot1CardRevision();
+    CHECK(r1 != 0);
+    mem.write(0x8000, 0x42); // same value: no change
+    CHECK(mem.slot1CardRevision() == r1);
+    mem.write(0x8001, 0x43);
+    const uint64_t r2 = mem.slot1CardRevision();
+    CHECK(r2 != r1);
+    const uint8_t b = 0x44;
+    CHECK(mem.slot1CardImageWrite(0x10, &b, 1));
+    CHECK(mem.slot1CardRevision() != r2);
 }
 
 // SLOT2MAP with an empty Slot 2: the redirect must be inert, never divert a
@@ -1635,7 +1695,7 @@ void test_resolve_modulespec_ambiguous() {
 // The ordered multi-directory overload: bundled catalogue first, then a
 // fallback directory (the GUI's iCloud `BatteryCards/` folder) that holds a
 // user's saved battery-card instance named `CE-1601M - Programs.card.yaml`
-// (module-name with spaces, the exact string `- modulespec:` would carry).
+// (module-name with spaces, the exact string `slot-N:` would carry).
 void test_resolve_modulespec_multi_dir() {
     const std::string bundled = makeScratchCardDir();  // ce155 / ce1600m / ce1601m
     const std::string instances = "/tmp/memory_card_catalog_tests_instances";
@@ -1842,6 +1902,8 @@ void test_reject_unbanked_flash_sector_not_dividing_capacity() {
 }
 
 int run_memory_card_tests() {
+    test_rom_from_a_sidecar_file();
+    test_card_content_revision();
     test_power_up_fill_defaults_per_kind();
     test_yaml_block_map_and_scalars();
     test_yaml_hex_ints();

@@ -6,7 +6,11 @@
 // it has, since neither exists for SC7852 yet (trace lands in Phase 5.3).
 //
 // Usage: pc1600_cli <romI-0-file> <romII-0-file> [maxCycles]
-//        pc1600_cli --preset <preset-file.pc1600> [maxCycles] [--dump-basic] [--modules-dir <dir>] [--save-dir <dir>] [--wav <out.wav>] [--rom new|old] [--ce1600p-rom new|old]
+//        pc1600_cli --check-preset <preset-file>...
+//        pc1600_cli --preset <preset-file.pc1600> [maxCycles] [--dump-basic] [--modules-dir <dir>] [--save-dir <dir>] [--wav <out.wav>] [--rom new|old] [--ce1600p-rom new|old] [--lcd-png <out.png>]
+//
+// --check-preset parses each preset (any model) and reports ok / the error,
+// without booting anything; tools/check_presets.sh runs it over the repo.
 //
 // The --preset form loads the confirmed PC-1600 ROM set from roms/ (same
 // names pc1600_preset_tests.cpp uses), builds a full PC1600Machine, and
@@ -19,17 +23,21 @@
 // --rom new|old (--preset only) overrides the preset's PC-1600 ROM version
 // (`model: PC-1600:new|old`, default new).
 // --ce1600p-rom new|old (--preset only) overrides the preset's CE-1600P ROM
-// version (`plotter: ce1600p:new|old`, default new); independent of --rom.
+// version (`plotter: CE-1600P:new|old`, default new); independent of --rom.
 //
-// --save-dir <dir> (--preset only) makes a `- saveas: floppy:<name>` step
-// write the live disk to <dir>/<name>.floppy.yaml (without it, saveas is a
-// logged no-op). Card saveas targets are not supported here.
+// `- saveas:` steps write cards and floppies like the GUI (Core/PC1600/
+// PC1600PresetMedia.hpp): the `file:<path>` form writes that file; a by-name
+// save goes to --save-dir <dir> (<dir>/<name>.card.yaml / .floppy.yaml) and
+// fails without it.
 //
-// CE-158 (--preset only, a preset with `interface: ce158`): --ce158-pty,
+// CE-158 (--preset only, a preset with `interface: CE-158`): --ce158-pty,
 // --ce158-rx <file>, --ce158-rx-hold <n>, --ce158-tx <file> -- same as
 // pc1500_cli (see its header). --run-after <tstates> keeps the machine
 // running that long after the preset script (e.g. to finish a serial
 // exchange with a --ce158-rx peer).
+//
+// --lcd-png <out.png> (--preset only) writes the LCD, as Copy Screen does,
+// once the preset (and any --run-after) has finished.
 //
 // --wav <out.wav> (--preset only) records the buzzer (OPC 18H, see
 // PiezoSampler.hpp) while the preset script runs, as 48 kHz mono 16-bit
@@ -49,25 +57,19 @@
 #include "../Core/PC1600/PC1600Machine.hpp"
 #include "../Core/PC1600/PC1600Memory.hpp"
 #include "../Core/PC1600/PC1600PresetLoader.hpp"
+#include "../Core/PC1600/PC1600PresetMedia.hpp"
+#include "../Core/PC1600/PC1600Screenshot.hpp"
 #include "../Core/Preset/PresetFile.hpp"
 #include "../Core/Resources/BundledRomCatalog.hpp"
 #include "Ce158CliPeer.hpp"
+#include "CliCommon.hpp"
 
 namespace {
-bool readFile(const std::string& path, std::vector<uint8_t>* out) {
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return false;
-    out->resize(16384);
-    size_t n = std::fread(out->data(), 1, 16384, f);
-    std::fclose(f);
-    return n == 16384;
-}
-
 int runPreset(const std::string& presetPath, uint64_t maxCycles, bool dumpBasic,
               const std::string& moduleDir, const std::vector<std::string>& extraModuleDirs,
               const std::string& wavPath, const std::string& romOverride,
               const std::string& ce1600pRomOverride, const std::string& saveDir,
-              Ce158CliPeer& ce158Peer, uint64_t runAfter) {
+              Ce158CliPeer& ce158Peer, uint64_t runAfter, const std::string& lcdPng) {
     (void)maxCycles;
     PresetFile preset;
     std::string error;
@@ -105,30 +107,21 @@ int runPreset(const std::string& presetPath, uint64_t maxCycles, bool dumpBasic,
     };
     if (!wavPath.empty()) machine.setYieldHook(drainWav, PC1600Machine::kTStateHz / 20);
     if (!ce158Peer.attach(machine)) return 1; // before the preset attaches the card
-    PresetSaveAsFn onSaveAs;
-    if (!saveDir.empty()) {
-        onSaveAs = [&machine, &saveDir](PresetStep::SaveAsTarget target, const std::string& name,
-                                        std::string* err) {
-            if (target != PresetStep::SaveAsTarget::Floppy) {
-                *err = "pc1600_cli --save-dir only saves floppies";
-                return false;
-            }
-            const std::string path = saveDir + "/" + name + kFloppyFileSuffix;
-            FILE* f = std::fopen(path.c_str(), "wb");
-            if (!f) {
-                *err = "cannot write " + path;
-                return false;
-            }
-            const std::string text = formatFloppyFile(name, machine.ce1600fDiskImage());
-            const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
-            return std::fclose(f) == 0 && ok;
-        };
-    }
+    // `saveas:` -- the file form always works; a by-name save needs
+    // --save-dir. Cards splice into the file the loader attached them from
+    // (reported by onArmed, before any step runs).
+    PresetLoadResult armedResult;
+    const auto onArmed = [&armedResult](const PresetLoadResult& r) { armedResult = r; };
+    const PresetSaveAsFn onSaveAs = [&machine, &saveDir, &armedResult](const PresetSaveAsRequest& request,
+                                                                       std::string* err) {
+        return savePC1600PresetMedia(machine, request, saveDir, armedResult.slot1ResolvedPath,
+                                     armedResult.slot2ResolvedPath, err);
+    };
     PresetLoadResult loaded = applyPC1600Preset(
         machine, preset,
         [](const std::string& line) { std::fprintf(stderr, "[preset] %s\n", line.c_str()); }, ".",
         moduleDir,
-        /*onBooted=*/{}, /*romDirs=*/{"roms"}, extraModuleDirs, /*onArmed=*/{}, onSaveAs);
+        /*onBooted=*/{}, /*romDirs=*/{"roms", "firmware/pc1600-hostdrive"}, extraModuleDirs, onArmed, onSaveAs);
     for (const std::string& r : loaded.rejectedBasicLines)
         std::fprintf(stderr, "preset: rejected BASIC line: %s\n", r.c_str());
     if (!loaded.ok && dumpBasic) {
@@ -155,10 +148,14 @@ int runPreset(const std::string& presetPath, uint64_t maxCycles, bool dumpBasic,
     }
     std::printf("Preset '%s' applied successfully.\n", presetPath.c_str());
     if (runAfter) machine.runCycles(runAfter);
-    if (machine.ce150Attached()) {
-        std::printf("CE-150: attached, plot points=%zu revision=%llu\n", machine.ce150PlotPoints().size(),
-                    static_cast<unsigned long long>(machine.ce150PlotRevision()));
+    if (!lcdPng.empty()) {
+        std::string pngError;
+        if (!writeLcdScreenshotPng(pc1600LcdBitmap(machine), kPC1600ScreenMm, lcdPng, &pngError)) {
+            std::fprintf(stderr, "failed to write '%s': %s\n", lcdPng.c_str(), pngError.c_str());
+            return 1;
+        }
     }
+    cli::printCe150Report(machine);
     if (!ce158Peer.report(machine)) return 1;
 
     if (!wavPath.empty()) {
@@ -215,6 +212,22 @@ int runPreset(const std::string& presetPath, uint64_t maxCycles, bool dumpBasic,
 } // namespace
 
 int main(int argc, char** argv) {
+    // --check-preset: parse only (parsePresetFile is model-agnostic, so
+    // this covers PC-1500 presets too); nothing is booted.
+    if (argc >= 3 && std::strcmp(argv[1], "--check-preset") == 0) {
+        int failed = 0;
+        for (int i = 2; i < argc; ++i) {
+            PresetFile preset;
+            std::string error;
+            if (parsePresetFile(argv[i], &preset, &error)) {
+                std::printf("ok    %s\n", argv[i]);
+            } else {
+                std::printf("FAIL  %s: %s\n", argv[i], error.c_str());
+                failed++;
+            }
+        }
+        return failed == 0 ? 0 : 1;
+    }
     if (argc >= 3 && std::strcmp(argv[1], "--preset") == 0) {
         uint64_t maxCycles = 2'000'000ull;
         bool dumpBasic = false;
@@ -224,7 +237,8 @@ int main(int argc, char** argv) {
         std::string saveDir;
         Ce158CliPeer ce158Peer;
         uint64_t runAfter = 0;
-        std::string moduleDir = ".";
+        std::string lcdPng;
+        std::string moduleDir = "Qt6/resources/cards";
         std::vector<std::string> extraModuleDirs;  // 2nd+ `--modules-dir`, searched after `moduleDir`
         bool moduleDirSet = false;
         for (int i = 3; i < argc; ++i) {
@@ -234,6 +248,7 @@ int main(int argc, char** argv) {
             else if (std::strcmp(argv[i], "--ce1600p-rom") == 0 && i + 1 < argc) ce1600pRomOverride = argv[++i];
             else if (std::strcmp(argv[i], "--save-dir") == 0 && i + 1 < argc) saveDir = argv[++i];
             else if (std::strcmp(argv[i], "--run-after") == 0 && i + 1 < argc) runAfter = std::strtoull(argv[++i], nullptr, 10);
+            else if (std::strcmp(argv[i], "--lcd-png") == 0 && i + 1 < argc) lcdPng = argv[++i];
             else if (ce158Peer.parseArg(argc, argv, i)) {}
             else if (std::strcmp(argv[i], "--modules-dir") == 0 && i + 1 < argc) {
                 if (!moduleDirSet) { moduleDir = argv[++i]; moduleDirSet = true; }
@@ -242,22 +257,23 @@ int main(int argc, char** argv) {
             else maxCycles = std::strtoull(argv[i], nullptr, 10);
         }
         return runPreset(argv[2], maxCycles, dumpBasic, moduleDir, extraModuleDirs, wavPath, romOverride,
-                         ce1600pRomOverride, saveDir, ce158Peer, runAfter);
+                         ce1600pRomOverride, saveDir, ce158Peer, runAfter, lcdPng);
     }
     if (argc < 3) {
         std::fprintf(stderr, "usage: %s <romI-0-file> <romII-0-file> [maxCycles]\n", argv[0]);
-        std::fprintf(stderr, "       %s --preset <preset-file.pc1600> [maxCycles] [--dump-basic] [--wav <out.wav>] [--rom new|old] [--ce1600p-rom new|old]\n", argv[0]);
+        std::fprintf(stderr, "       %s --check-preset <preset-file>...\n", argv[0]);
+        std::fprintf(stderr, "       %s --preset <preset-file.pc1600> [maxCycles] [--dump-basic] [--wav <out.wav>] [--rom new|old] [--ce1600p-rom new|old] [--lcd-png <out.png>]\n", argv[0]);
         return 1;
     }
     uint64_t maxCycles = 2'000'000ull;
     if (argc >= 4) maxCycles = std::strtoull(argv[3], nullptr, 10);
 
     std::vector<uint8_t> lower, upper;
-    if (!readFile(argv[1], &lower)) {
+    if (!cli::readFileExact(argv[1], 16384, &lower)) {
         std::fprintf(stderr, "failed to read '%s' (expected exactly 16384 bytes)\n", argv[1]);
         return 1;
     }
-    if (!readFile(argv[2], &upper)) {
+    if (!cli::readFileExact(argv[2], 16384, &upper)) {
         std::fprintf(stderr, "failed to read '%s' (expected exactly 16384 bytes)\n", argv[2]);
         return 1;
     }

@@ -1,16 +1,38 @@
 #pragma once
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <vector>
 
+#include "../MachineCodeFile.hpp"
 #include "../PC1500/PC1500Variant.hpp"
+#include "../Yaml.hpp"
 
 // ── Preset file model + parser (the "common loader": file open, parse, ──
 //     model resolution -- see the 3-part structure note below) ───────────
 //
-// A hand-rolled parser for this project's `.pc1500` YAML preset format.
-// Deliberately scoped: no rom-modules/check support.
+// A hand-rolled parser for the preset format (`.pc1500`, `.pc1500a`,
+// `.pc1600`; docs/User-Guide.md chapter 8 is the reference). YAML-shaped,
+// not YAML (docs/background/Decisions.md): flat `key: value` top-level
+// fields, `- verb: value` steps, one `text: |` block scalar, and a `type:`
+// step that is typed exactly as written to the end of the line (`PRINT #1`
+// keeps its `#`, quotes are typed). Only `debug:` and `bus-rom:` are YAML
+// proper and go to Core/Yaml.hpp. Tabs, flow style and multiple documents
+// are rejected.
+//
+// The naming rules:
+//   * Sharp's product names, hyphen included, in any case: `model: PC-1600`,
+//     `plotter: CE-1600P`, `interface: CE-158`. A ROM choice rides on the
+//     name after a colon (`PC-1500:A03`, `PC-1600:old`, `CE-1600P:old`).
+//   * A device by name, or by file: `slot-1: CE-1600M` / `slot-1-file:
+//     my.card.yaml`, `floppy: Formatted` / `floppy-file: my.floppy.yaml`.
+//     A path-valued key is `file` or ends in `-file`, except `host-drive:`,
+//     a folder. Paths are relative to the preset; `~/` is the home folder.
+//   * `saveas:` names its device with the same words: `slot-1`, `slot-2`,
+//     `floppy`.
+//   * Numbers: `&`, `0x` or `$` makes them hex, otherwise decimal.
+//   * Leaving a key out means "none"; there is no `none` value.
 //
 // PRESET LOADING IS THREE PARTS:
 //   1. this file -- parsePresetFile() opens the file, parses it, and
@@ -26,63 +48,47 @@
 //      family loader) lives in the GUI's PresetController::loadPreset and
 //      in each CLI.
 //
-// `memory-expansion:` accepts exactly one module, named by definition
-// (`- modulespec: <module-name>` / `- modulespecfile: <path>`, see
-// PresetFile::memoryExpansionModuleSpecName); a PC-1600 preset instead uses
-// `memory-expansion-1:` / `memory-expansion-2:`. Every other extra field, or
-// `rom-modules:`/`check` step remains rejected. `PC-1500`, `PC-1500A` and
-// `PC-1600` models are accepted (see PresetFile::isPC1600 / variant). Not general
-// YAML: flat `key: value` top-level mappings, `- key: value` sequence
-// items (one verb per step, no further nesting), and one `text: |` block
-// scalar. Step verbs: `key:`, `type:`, `wait:`, `trace:`, `screenshot:`,
-// `syncclock:`, and `saveas:`. `- wait: N`
-// runs N seconds of emulated time; `- wait:` with no value blocks until the
-// ROM's keyboard idle loop re-engages -- i.e. until a long-running program
-// or plot has finished (a generous safety cap still applies). `trace:` is
-// a port of Calc-U-59's `KEYSTROKES:` `Trace:` directive: `- trace:
-// name.bin` starts a CPU instruction trace to `name.bin` under the
-// configured trace directory (silently overwriting an existing file;
-// starting a new one first closes the open one), `- trace: off` stops it,
-// and any trace still open when the preset finishes is closed
-// automatically. The filename must not contain a path separator. See
-// PC1500PresetLoader.cpp's applyPC1500Preset(). `- screenshot: name.png`
-// writes a PNG of the LCD dot matrix at that point in the script into the
-// same trace directory (overwriting; same no-path-separator rule) -- the
-// image Edit > Copy Screen puts on the clipboard, see
-// Core/Display/LcdScreenshot.hpp. `- syncclock:` (no value) re-seeds the
-// machine's real-time clock from the host's current local time at that
-// point -- a preset load runs flat out, so put it last to undo the clock
-// running ahead during the load. A value may be `"double"` or `'single'`-quoted -- stripped and
-// passed through verbatim (see PresetFile.cpp's unquote()), kept for
-// older preset files that quote their values. A ` # comment`
-// after a value is stripped (a `type:` payload excepted -- `#` is BASIC
-// there; see PresetFile.cpp's stripInlineComment()). Tabs, flow style and
-// multiple documents are rejected/unsupported -- deliberately scoped to exactly the shape real
-// preset files (this project's own samples) actually use, not a
-// general-purpose YAML implementation.
+// Step verbs: `key:`, `type:`, `wait:`, `trace:`, `screenshot:`,
+// `syncclock:`, `saveas:`. `- wait: N` runs N seconds of emulated time;
+// `- wait:` with no value blocks until the ROM's keyboard idle loop
+// re-engages -- i.e. until a long-running program or plot has finished (a
+// generous safety cap still applies). `- trace: name.bin` starts a CPU
+// instruction trace to `name.bin` under the configured trace directory
+// (overwriting; starting a new one first closes the open one), `- trace:
+// off` stops it, and a trace still open when the preset finishes is closed.
+// `- screenshot: name.png` writes the LCD (the image Edit > Copy Screen
+// puts on the clipboard, Core/Display/LcdScreenshot.hpp) into the same
+// directory. Neither file name may contain a path separator. `- syncclock:`
+// re-seeds the real-time clock from the host's local time -- a preset load
+// runs flat out, so put it last. A ` # comment` after a value is stripped,
+// except after `type:`.
 //
-// `- saveas: s1:<name>` / `- saveas: s2:<name>` / `- saveas: floppy:<name>`
-// saves the live battery card in slot 1/2, or the live floppy disk, to the
-// environment's configured save directory under `<name>` -- the scripted
-// counterpart of the control bar's "Name & Save" icon. `s2:`/`floppy:` are
-// PC-1600 only (rejected on a PC-1500/1500A preset); `s1:` works on either
-// model. Unlike the GUI's Name & Save, it works even when the slot/floppy
-// was already saved/loaded from a named instance, and it silently
-// overwrites an existing file of the same name -- so a preset can
-// `saveas:` a card or floppy more than once, under different names, as it
-// evolves through the script. See PC1600PresetLoader.hpp's
-// PresetSaveAsFn (below) -- WHERE
-// the save goes is environment-specific (the GUI's configured instance
-// directory), so Core only parses the step; a caller that doesn't supply
-// the callback gets a logged no-op.
+// `- saveas: template|live <device>:<name>` saves the battery card in
+// `slot-1` / `slot-2`, or the floppy disk (`floppy`) -- the scripted
+// counterpart of the control bar's "Name & Save". The leading word is
+// required:
+//   * `live`     -- an ordinary instance: the GUI autosaves later changes
+//                   into it.
+//   * `template` -- written with `template: true`: read-only from then on,
+//                   every use starts from the saved contents.
+// `<name>` saves into the environment's configured save directory under that
+// module-name / disk-name. `file:<path>` instead writes exactly that file,
+// relative to the preset's own directory; the path must end in `.card.yaml`
+// (slots) or `.floppy.yaml` (floppy), and the name is the file name without
+// that suffix:
+//   - saveas: template slot-2:file:CE-1601M - Progs.card.yaml
+//   - saveas: live floppy:Progs
+// `slot-2`/`floppy` are PC-1600 only. Unlike the GUI's Name & Save, it works
+// even when the slot/floppy was already saved/loaded from a named instance,
+// and it silently overwrites an existing file of the same name (a template
+// too). WHERE a by-name save goes is environment-specific, so Core only
+// parses the step and hands a PresetSaveAsRequest to PresetSaveAsFn (below);
+// a caller that doesn't supply the callback gets a logged no-op.
 //
-// This project's loader treats a preset as an ordered SEQUENCE of
-// `keys:`/`program:` blocks, executed top-to-bottom in file order -- so a
-// preset can install a loader/firmware program, run it, then load and run
-// a second payload program, all from one file (see
-// examples/memtest_bank.pc1500a). `pre-load-keys:`/`post-load-keys:` are
-// not recognized at all -- both become a single, repeatable `keys:` block
-// name.
+// A preset is an ordered SEQUENCE of `keys:`/`program:` blocks, executed
+// top-to-bottom in file order -- so a preset can install a loader program,
+// run it, then load and run a second payload (see
+// examples/setup/firmware_bootstrap_util_15.pc1500a).
 struct PresetStep {
     enum class Kind { Key, Type, Wait, Trace, Screenshot, SyncClock, SaveAs };
     Kind kind = Kind::Key;
@@ -102,25 +108,37 @@ struct PresetStep {
     static constexpr double kWaitUntilIdle = -1.0;
 
     // (SaveAs) which slot/device `text` (the name) should be saved under --
-    // parsed from `- saveas: s1:<name>` / `s2:<name>` / `floppy:<name>`.
-    // S2/Floppy are PC-1600 only; see parsePresetFile()'s per-model
-    // validation.
-    enum class SaveAsTarget { S1, S2, Floppy };
-    SaveAsTarget saveAsTarget = SaveAsTarget::S1;
+    // parsed from `- saveas: template|live slot-1:<name>` / `slot-2:` /
+    // `floppy:`. Slot2/Floppy are PC-1600 only; see parsePresetFile()'s
+    // per-model validation.
+    enum class SaveAsTarget { Slot1, Slot2, Floppy };
+    SaveAsTarget saveAsTarget = SaveAsTarget::Slot1;
+    // (SaveAs) `template` (true) or `live` (false).
+    bool saveAsTemplate = false;
+    // (SaveAs) the `file:<path>` form: the file to write, resolved relative
+    // to the preset's directory. Empty = save by name into the save folder.
+    std::string saveAsPath;
 };
 
-/// Fired for a `- saveas: s1:<name>` / `s2:<name>` / `floppy:<name>` step
-/// (see the top-of-file doc comment) -- WHERE the save goes, and how to
-/// splice/format it, are environment-specific (Qt6/app's AppPaths/
-/// MemoryModuleManager/FloppyDiskManager), so Core only calls out here,
-/// mirroring onArmed/onBooted. `target` is which slot/device to save
-/// (always S1 on a PC-1500/1500A -- the parser rejects the others); `name`
-/// is the name to save it under. Returns true on success, or false with
-/// `*error` filled in -- a failure stops the preset exactly like any other
-/// step failure. Left unset (the default) makes a `saveas:` step a logged
-/// no-op, for a caller (CLI, tests) with no configured save directory.
-using PresetSaveAsFn =
-    std::function<bool(PresetStep::SaveAsTarget target, const std::string& name, std::string* error)>;
+/// One `saveas:` step, as handed to PresetSaveAsFn.
+struct PresetSaveAsRequest {
+    PresetStep::SaveAsTarget target = PresetStep::SaveAsTarget::Slot1;
+    std::string name;      // module-name / disk-name to save under
+    std::string path;      // `file:` form: the file to write; "" = by name, into the save folder
+    bool isTemplate = false;
+};
+
+/// Fired for a `- saveas:` step (see the top-of-file doc comment) -- WHERE a
+/// by-name save goes, and how to splice/format it, are environment-specific
+/// (Qt6/app's AppPaths/MemoryModuleManager/FloppyDiskManager, or
+/// PC1600PresetMedia.hpp for the headless tools), so Core only calls out
+/// here, mirroring onArmed/onBooted. `request.target` is always S1 on a
+/// PC-1500/1500A (the parser rejects the others). Returns true on success,
+/// or false with `*error` filled in -- a failure stops the preset exactly
+/// like any other step failure. Left unset (the default) makes a `saveas:`
+/// step a logged no-op, for a caller (tests) with no configured save
+/// directory.
+using PresetSaveAsFn = std::function<bool(const PresetSaveAsRequest& request, std::string* error)>;
 
 /// Runs one `saveas:` step through `onSaveAs` (both preset loaders share
 /// this). Returns false with `*error` set ("saveas: ...") on failure.
@@ -130,61 +148,54 @@ inline bool runPresetSaveAsStep(const PresetStep& step, const PresetSaveAsFn& on
         if (log) log("  saveas: skipped (no save handler configured)");
         return true;
     }
+    PresetSaveAsRequest request;
+    request.target = step.saveAsTarget;
+    request.name = step.text;
+    request.path = step.saveAsPath;
+    request.isTemplate = step.saveAsTemplate;
     std::string saveError;
-    if (!onSaveAs(step.saveAsTarget, step.text, &saveError)) {
+    if (!onSaveAs(request, &saveError)) {
         if (error) *error = "saveas: " + saveError;
         if (log) log("  saveas: FAILED: " + saveError);
         return false;
     }
-    if (log) log("  saveas: -> \"" + step.text + "\"");
+    if (log)
+        log(std::string("  saveas: ") + (request.isTemplate ? "template" : "live") + " -> \"" + request.name + "\"" +
+            (request.path.empty() ? "" : " (" + request.path + ")"));
     return true;
 }
 
 struct PresetProgram {
-    // Binary      -- `format: binary`: machine-code bytes poked verbatim,
-    //                no BASIC-pointer fix-up (a CALL payload). The file may
-    //                carry the machine's own machine-code header -- CE-158
-    //                on a PC-1500/1500A, the 16-byte PC-1600 one on a PC-1600
-    //                (Core/MachineCodeFile.hpp) -- which supplies the load
-    //                address and length; `address` / `length` each override
-    //                their header field, and a headerless file needs
-    //                `address` (its length defaults to the whole file). A
-    //                PC-1600 preset also gives `slot: S0|S1|S2` and loads
-    //                linearly into that one slot. A non-zero auto-run
-    //                address in the header makes the loader type
-    //                `CALL &<addr>` afterwards, so the machine must be in RUN
-    //                mode at the end of the block (it is by default after
-    //                boot; a preceding `keys:` block that went to PRO must
-    //                `- key: mode` back first).
-    // BasicText   -- `format: basic-text`: BASIC source typed in through the
-    //                ROM's line editor (slow, but exact); `text` holds it.
-    // BasicBinary -- `format: basic-binary` (alias `basic-tokenized`): a
-    //                plain-text BASIC listing at `path`, tokenized in-process
-    //                on load (via libsharpdx, headerless) into the run of
-    //                in-RAM line records. The loader pokes it into the BASIC
-    //                program area and fixes BASPRG_END -- fast, unlike the
-    //                keystroke typer `basic-text` uses. `address` is unused
-    //                (the base comes from the ROM's own pointers). Like
-    //                `basic-text`, the preset must first leave the machine
-    //                loadable -- a
-    //                `keys:` section with `- key: cl` / `- type: NEW0`
-    //                (PC-1600 also needs `- key: mode` for PRO). See
-    //                Core/Basic/BasicBinaryImage.hpp and the model loaders.
+    // What the parser made of the block (parseProgramBlock()):
+    // Binary      -- `file:` holding machine code: behind the machine's own
+    //                header (CE-158 on a PC-1500/1500A, the 16-byte PC-1600
+    //                one; Core/MachineCodeFile.hpp), which supplies the load
+    //                address and length, or headerless, which needs
+    //                `address:`. `address:` / `length:` each override their
+    //                header field. On the PC-1600 the loader places code by
+    //                MODE, TITLE and the address, as Load Machine Code does
+    //                (docs/background/plans/Loader-Mode-Plan.md); `address:`
+    //                is an LH5803 address in MODE 1. A non-zero auto-run
+    //                address in the header makes the loader type the `CALL`
+    //                afterwards, so the machine must be in RUN mode by then.
+    // BasicBinary -- `file:` holding BASIC, a listing (tokenized in-process
+    //                via libsharpdx) or tokenized behind a CE-158 / PC-1600
+    //                header: poked into the program area as in-RAM line
+    //                records, BASPRG_END fixed -- fast. The preset must
+    //                first leave the machine loadable (`NEW0`, and PRO mode
+    //                on the PC-1600). Core/Basic/BasicProgramSource.hpp.
+    // BasicText   -- `text: |`, or `file:` + `typed: true` on a listing:
+    //                typed in through the ROM's line editor (slow, exact);
+    //                `text` holds the listing.
     enum class Format { Binary, BasicText, BasicBinary };
     Format format = Format::Binary;
-    std::string path;   // resolved absolute/relative-to-cwd path (Binary / BasicBinary, or BasicText loaded from a file)
+    std::string path;     // `file:`, resolved (Binary / BasicBinary)
     uint16_t address = 0; // Binary only -- load address (overrides the file header's)
-    std::string text;   // BasicText only -- the program source, one statement per line
+    std::string text;     // BasicText only -- the program source, one line per BASIC line
 
-    // `format: binary` only. `slot` is required for a PC-1600
-    // machine-language block (and rejected on a PC-1500); `S0` = internal
-    // RAM ($C000-$FFFF), `S1`/`S2` = the two 40-pin memory slots
-    // ($8000-$BFFF window). `length` (bytes) overrides the header's length
-    // field, or the whole-file length of a headerless file. `hasAddress` /
-    // `hasLength` record whether the field was present in the preset (0 is
-    // a legal explicit value).
-    enum class Slot { None, S0, S1, S2 };
-    Slot slot = Slot::None;
+    // Binary only. `length` (bytes) overrides the header's length field, or
+    // the whole-file length of a headerless file. `hasAddress` /
+    // `hasLength` record whether the field was present (0 is a legal value).
     uint32_t length = 0;
     bool hasAddress = false;
     bool hasLength = false;
@@ -198,117 +209,103 @@ struct PresetSection {
     PresetProgram program;          // Kind::Program
 };
 
-struct PresetFile {
-    std::string model;
-    /// True for `model: PC-1600` -- derived from `model` rather than stored
-    /// alongside it, so the two can't disagree. The PC-1600 is a separate
-    /// machine (Core/PC1600/) with its own two memory slots
-    /// (memory-expansion-1:/memory-expansion-2: below); its calculator ROM
-    /// version rides on the model (`model: PC-1600:old`, default `new`;
-    /// stored in `romVariant`) and it takes no `memory-expansion:`
-    /// (unsuffixed) block. `model` itself always holds the bare name.
-    /// `variant` below is unused.
-    /// Applied by Core/PC1600/PC1600PresetLoader.cpp, not applyPC1500Preset().
-    bool isPC1600() const { return model == "PC-1600"; }
-    // Parsed from `model:` -- PC1500Variant::PC1500A for "PC-1500A",
-    // PC1500Variant::PC1500 for "PC-1500". Whoever calls applyPC1500Preset() is
-    // responsible for running it against a PC1500Machine already
-    // constructed with this variant (variant is fixed at construction --
-    // see PC1500Memory.hpp).
-    PC1500Variant variant = PC1500Variant::PC1500A;
-    // Parsed from the ROM suffix of `model: NAME[:ROM]`.
-    // PC-1600: "new" or "old" (calculator ROM version, default "new"), from
-    // `model: PC-1600:old`.
-    // PC-1500/1500A: which ROM revision to run, always one of "A01"/"A03"/"A04"
-    // -- never a file path. There are only three real options across all
-    // three machines: the PC-1600 chooses "new"/"old" instead (see above),
-    // the PC-1500A can only run A04 (`model: PC-1500A:A04`; any other suffix
-    // is a parse error), and the PC-1500 (non-A) is the only model that
-    // actually chooses between A01/A03/A04 (`model: PC-1500:A03`). With no
-    // suffix it defaults to "A04". (The old `firmware:` key is gone -- it is
-    // a parse error pointing at this syntax.) WHERE the actual ROM file for
-    // this variant lives is deliberately not this struct's concern -- that's
-    // environment-specific (a CLI tool's repo-relative `roms/` convention vs.
-    // a GUI app's bundled resource lookup) and is left to whoever calls
-    // applyPC1500Preset() (PC1500PresetLoader.hpp) to resolve.
-    std::string romVariant;
-    // `keys:`/`program:` blocks, in file order -- see PresetSection above
-    // and the sequential-blocks note at the top of this file. Applied in this exact
-    // order by PC1500PresetLoader.cpp's applyPC1500Preset().
-    std::vector<PresetSection> sections;
-    // The pen-plotter/printer on the 60-pin system bus. `""` (key absent)
-    // = none. Normalized to lower case; `plotter: none`/`off` -> `""`.
-    //
-    //  * PC-1600 preset: `"ce1600p"` (`plotter: ce1600p[:new|old]`, ROM in
-    //    `ce1600pRomVariant`; attached by applyPC1600Preset before
-    //    the cold boot so the ROM sees it -- the loader needs the CE-1600P
-    //    ROM path passed in). `"ce150"` also valid once the PC-1600
-    //    LH5803-side CE-150 support lands (Phase 2); until then
-    //    applyPC1600Preset rejects it.
-    //  * PC-1500 / PC-1500A preset: `"ce150"` (attached by
-    //    applyPC1500Preset before reset(); the loader needs the CE-150 ROM
-    //    path passed in). `"ce1600p"` is a parse error -- that is a PC-1600
-    //    device.
-    std::string plotter;
-    // The serial / parallel interface on the 60-pin system bus. `""` (key
-    // absent, or `interface: none`/`off`) = none; `"ce158"` = the CE-158
-    // (`interface: ce158` / `ce-158`). It sits alongside `plotter: ce150`
-    // or alone, on a PC-1500 / PC-1500A or a PC-1600 (LH5803 side, MODE 1;
-    // not together with `plotter: ce1600p`).
-    std::string interfaceName;
-    // PC-1600 only: "new" or "old" -- the CE-1600P ROM version, from
-    // `plotter: ce1600p:old` (default "new", also when there is no plotter).
-    // Independent of `romVariant`; the CE-1600F in the same box follows it.
-    // Any ROM suffix on another plotter is a parse error.
-    std::string ce1600pRomVariant = "new";
-
-    // PC-1600 only: `floppy: <name>` names a saved CE-1600F disk by its
-    // `disk-name` (a `*.floppy.yaml` in the bundled or the user's save
-    // directory, bundled first -- see Connector/FloppyImageFile.hpp) to load into
-    // the floppy at attach time, instead of the default empty drive. An
-    // optional `,A` or `,B` suffix (`floppy: mydisk,B`) selects which side
-    // is facing the head once loaded (CE1600FCard::setSide()'s own
-    // comment) -- stripped into `floppySide` below, so `floppy` itself is
-    // always just the bare disk name. `""` (key absent) = no disk in the
-    // drive, matching the GUI's "–empty–" default. Only valid alongside
-    // `plotter: ce1600p` (attaching the CE-1600P always also attaches the
-    // CE-1600F, per their union attach/detach --
-    // PC1600Machine::attachCE1600P()); `floppy:` without `plotter:
-    // ce1600p` is a parse error. See Core/PC1600/PC1600PresetLoader.cpp.
-    std::string floppy;
-    // 0 = side A (default), 1 = side B -- parsed from `floppy:`'s `,A`/`,B`
-    // suffix. Meaningless when `floppy` is empty (no disk).
-    int floppySide = 0;
-
-    // The module in `memory-expansion:` (PC-1500/1500A) or in
-    // `memory-expansion-1:` / `memory-expansion-2:` (the PC-1600's two
-    // memory slots): a one-item block naming a
-    // docs/Memory-Card-Definition-Format.md definition in one of two ways.
-    // At most one of `<...>ModuleSpecFile` / `<...>ModuleSpecName` is set
-    // per block; both empty for no block (an empty slot). The loader (PC1500PresetLoader /
-    // PC1600PresetLoader) turns whichever is set into a card via
-    // Core/Connector/SoftwareDefinedCard.hpp's makeSoftwareDefinedCard().
-    //
-    //  * `- modulespecfile: <path>` -- a definition FILE. Resolved here to
-    //    an absolute / cwd-relative path (like `program.path`, relative to
-    //    the preset's own directory).
-    std::string memoryExpansionModuleSpecFile;
-    std::string slot1ModuleSpecFile;
-    std::string slot2ModuleSpecFile;
-    //  * `- modulespec: <module-name>` -- a bundled/standard module,
-    //    referenced by the `module-name:` of its definition. Stored
-    //    verbatim (unresolved); the loader looks it up in a caller-
-    //    supplied module directory via
-    //    Core/Connector/MemoryCardCatalog.hpp's resolveModuleSpecByName().
-    std::string memoryExpansionModuleSpecName;
-    std::string slot1ModuleSpecName;
-    std::string slot2ModuleSpecName;
+/// One `bus-rom:` item: a ROM file on the 60-pin bus (Connector/BusRomCard.hpp).
+/// Either `bank` (PC-1600 system bus, page B bank 4-7) or `address` (PC-1500
+/// connector, or the PC-1600's LH5803 side) with its `me` / `pv` / `pu` gates.
+struct PresetBusRom {
+    std::string path;  // resolved against the preset's directory; read at load time
+    int bank = -1;     // 4-7, or -1 = `address`
+    uint16_t address = 0;
+    bool me1 = false;  // `me: 1`
+    int pv = -1, pu = -1;  // 0 / 1, or -1 = either
 };
 
-/// Parses the `.pc1500` preset file at `path` into `out`. File paths
-/// inside the preset (`program.path`) are resolved relative to `path`'s
-/// own directory. Returns false and fills `error` (including a line
+struct PresetFile {
+    /// "PC-1500", "PC-1500A" or "PC-1600" (canonical spelling; the ROM
+    /// suffix is split off into `romVariant`).
+    std::string model;
+    /// The PC-1600 is a separate machine (Core/PC1600/), applied by
+    /// Core/PC1600/PC1600PresetLoader.cpp, not applyPC1500Preset().
+    bool isPC1600() const { return model == "PC-1600"; }
+    // PC-1500 / PC-1500A only. Whoever calls applyPC1500Preset() runs it
+    // against a PC1500Machine already constructed with this variant (fixed
+    // at construction -- see PC1500Memory.hpp).
+    PC1500Variant variant = PC1500Variant::PC1500A;
+    // The ROM suffix of `model: NAME[:ROM]`, defaulted. PC-1600: "new" or
+    // "old". PC-1500: "A01", "A03" or "A04" (default A04); the PC-1500A runs
+    // A04 only. WHERE the ROM file lives is the caller's concern (a CLI's
+    // `roms/` vs the GUI's bundled resources).
+    std::string romVariant;
+    // `keys:`/`program:` blocks, in file order.
+    std::vector<PresetSection> sections;
+    // The plotter: "" (none), "ce150" (`plotter: CE-150`, any model; on the
+    // PC-1600 it sits on the LH5803 side, MODE 1) or "ce1600p" (`plotter:
+    // CE-1600P`, PC-1600 only). Attached before the cold boot so the ROM
+    // sees it.
+    std::string plotter;
+    // The interface: "" (none) or "ce158" (`interface: CE-158`). On a
+    // PC-1600 it sits on the LH5803 side and can't be combined with the
+    // CE-1600P.
+    std::string interfaceName;
+    // PC-1600 only: "new" or "old" -- the CE-1600P ROM version, from
+    // `plotter: CE-1600P:old` (default "new", also when there is no plotter).
+    // Independent of `romVariant`; the CE-1600F in the same box follows it.
+    std::string ce1600pRomVariant = "new";
+
+    // PC-1600 only, and only with the CE-1600P (the CE-1600F comes with it).
+    // `floppy: <name>` names a saved disk by its `disk-name` (bundled first,
+    // then the save folder -- Connector/FloppyImageFile.hpp);
+    // `floppy-file: <path>` names a `.floppy.yaml` file instead. An optional
+    // `,A` / `,B` suffix picks the side facing the head (`floppySide`). At
+    // most one of the two is set; both empty = no disk, as the GUI's
+    // "–empty–".
+    std::string floppy;
+    std::string floppyFile;
+    int floppySide = 0;  // 0 = side A (default), 1 = side B
+
+    // PC-1600 only: `host-drive: <dir>` mounts that folder as drive S3:
+    // (PC1600HostDriveCard), attached before the cold boot. Resolved like
+    // every path. Empty = no host drive. docs/PC1600-Host-Drive.md.
+    std::string hostDrive;
+
+    // The memory module in each slot (the PC-1500/1500A has `slot-1` only),
+    // a docs/Memory-Card-Definition-Format.md definition:
+    //  * `slot-N-file: <path>` -- a definition FILE, resolved.
+    //  * `slot-N: <module-name>` -- a bundled or saved module by its
+    //    `module-name:`, stored verbatim; the loader looks it up
+    //    (Core/Connector/MemoryCardCatalog.hpp's resolveModuleSpecByName()).
+    // At most one of the pair is set; both empty = an empty slot. The loader
+    // turns it into a card via Core/Connector/SoftwareDefinedCard.hpp.
+    std::string slot1ModuleSpecFile;
+    std::string slot1ModuleSpecName;
+    std::string slot2ModuleSpecFile;
+    std::string slot2ModuleSpecName;
+
+    // `bus-rom:` -- ROM files plugged into the 60-pin bus before power-on,
+    // in front of every other card there, so they shadow a bundled ROM at
+    // the same place (developing a ROM extension, docs/Debugger.md).
+    std::vector<PresetBusRom> busRoms;
+
+    /// Not parsed: set by the caller. The loaders then stop once the machine
+    /// is armed (model, modules, peripherals, bus ROMs) -- no reset, no boot
+    /// run, no `keys:` / `program:` -- for a debugger that runs the boot
+    /// itself (`debug: boot: debug`).
+    bool armOnly = false;
+
+    // `debug:` -- the debugger's attach settings for a project preset
+    // (Core/Preset/PresetDebugBlock.hpp), paths already resolved. Null when
+    // the preset has none. Loading the preset ignores it.
+    YamlNode debug;
+};
+
+/// Parses the preset file at `path` into `out`. File paths inside the
+/// preset are resolved relative to `path`'s own directory; a `program:`
+/// file is read and classified here. Returns false and fills `error` (including a line
 /// number when available) on any parse failure or unsupported field; a
 /// preset is parsed all-or-nothing, so a bad preset fails before the
 /// machine is even started.
 bool parsePresetFile(const std::string& path, PresetFile* out, std::string* error);
+
+/// A path in a preset: `~` / `~/...` is the home directory, anything else
+/// relative is relative to the preset's directory `dir`.
+std::string resolvePath(const std::filesystem::path& dir, const std::string& value);

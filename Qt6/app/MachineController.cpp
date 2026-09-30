@@ -17,12 +17,12 @@
 #include "PC1600/PC1600Machine.hpp"
 #include "PC1600/PC1600Screenshot.hpp"
 #include "PC1600/PC1600TypedInput.hpp"
-#include "Serial/PtySerialLink.hpp"
 #include "Resources/BundledRomCatalog.hpp"
 #include "HostClock.hpp"
 #include "AppPaths.hpp"
 #include "AppSettings.hpp"
 #include "FloppyDiskManager.hpp"
+#include "debug/DebugController.hpp"
 #include "MemoryModuleManager.hpp"
 
 namespace {
@@ -74,7 +74,9 @@ Model initialModel() {
 } // namespace
 
 MachineController::MachineController(QObject* parent) : QObject(parent) {
+    m_debug = std::make_unique<DebugController>(this);
     switchModel(initialModel());
+    m_debug->refreshServer();
 }
 
 MachineController::~MachineController() = default;
@@ -83,15 +85,14 @@ void MachineController::switchModel(Model model, bool keepPlotter) {
     const bool restoreCE150 = keepPlotter && ce150Attached();
     const bool restoreCE1600P = keepPlotter && ce1600pAttached();
     const bool restoreCE158 = keepPlotter && ce158Attached();
+    const QString restoreHostDrive = keepPlotter && model == Model::PC1600 ? hostDriveDirectory() : QString();
     flushFloppyBeforeDetach(); // the old machine (and its disk) is going away
-    endTraceBeforeRebuild();
+    discardMachine();
     m_model = model;
-    m_paste.cancel({}); // the machine it was typing into is going away
-    m_pc1500.reset();
-    m_pc1600.reset();
 
     if (model == Model::PC1600) {
         makePC1600WithRomFallback();
+        wireNewMachine();
 
         // Attach any currently-selected memory modules before the cold
         // boot -- a module's state must be visible on the very first ROM
@@ -100,14 +101,14 @@ void MachineController::switchModel(Model model, bool keepPlotter) {
         if (restoreCE150) attachCE150();
         if (restoreCE1600P) attachCE1600P();
         if (restoreCE158) attachCE158();
-
-        attachSerialLink(*m_pc1600);
+        if (!restoreHostDrive.isEmpty()) attachHostDrive(restoreHostDrive);
     } else {
         const auto variant = (model == Model::PC1500A) ? PC1500Variant::PC1500A : PC1500Variant::PC1500;
         // PC-1500A is A04-only (PC1500Variant.hpp) -- clamp regardless of
         // whatever revision was last picked for the plain PC-1500.
         if (variant == PC1500Variant::PC1500A) m_pc1500RomRevision = PC1500RomRevision::A04;
         m_pc1500 = std::make_unique<PC1500Machine>(variant);
+        wireNewMachine();
 
         std::string err;
         if (!BundledRoms::loadPC1500Rom(*m_pc1500, pc1500RomVariantName(m_pc1500RomRevision),
@@ -121,8 +122,8 @@ void MachineController::switchModel(Model model, bool keepPlotter) {
     }
 
     // Every rebuild is a full cold boot, run flat out to the prompt (incl. a
-    // plotter's power-on init), after which resetToPrompt() sets the clock
-    // from the host -- the boot ran seconds of emulated time ahead of it.
+    // plotter's power-on init); the caller restarts paced emulation after
+    // it, which sets the clock from the host (see seedClockFromHost()).
     // PC1500Machine has only one reset level, so only the PC-1600 gets the
     // ALL RESET; a freshly-constructed machine's RAM is cleared either way.
     resetToPrompt(/*allReset=*/model == Model::PC1600);
@@ -135,13 +136,6 @@ void MachineController::switchModel(Model model, bool keepPlotter) {
 void MachineController::setPC1600RomVersion(PC1600RomVersion version) {
     m_pc1600RomVersion = version;
     if (m_model == Model::PC1600) switchModel(m_model, /*keepPlotter=*/true); // rebuild with the new ROM
-}
-
-bool MachineController::setCE1600PRomVersion(CE1600PRomVersion version) {
-    m_ce1600pRomVersion = version;
-    if (m_model != Model::PC1600 || !ce1600pAttached()) return false;
-    switchModel(m_model, /*keepPlotter=*/true); // rebuild with the new CE-1600P ROM
-    return true;
 }
 
 void MachineController::setPC1500RomRevision(PC1500RomRevision revision) {
@@ -177,14 +171,9 @@ void MachineController::makePC1600WithRomFallback() {
 }
 
 PC1500Machine& MachineController::resetBareForPresetPC1500(PC1500Variant variant) {
-    endTraceBeforeRebuild();
-    m_paste.cancel({});
-    m_pc1500.reset();
-    m_pc1600.reset();
+    discardMachine();
     m_pc1500 = std::make_unique<PC1500Machine>(variant);
-    // A preset's `interface: ce158` attaches the card itself; it picks up
-    // whatever link the machine holds (see syncCE158SerialLink()).
-    if (m_ce158SerialLink) m_pc1500->setCE158SerialLink(m_ce158SerialLink.get());
+    wireNewMachine(); // a preset's `interface: CE-158` picks up the link from here
     return *m_pc1500;
 }
 
@@ -192,13 +181,9 @@ PC1600Machine& MachineController::resetBareForPresetPC1600(PC1600RomVersion vers
                                                            CE1600PRomVersion ce1600pVersion) {
     m_pc1600RomVersion = version;
     m_ce1600pRomVersion = ce1600pVersion;
-    endTraceBeforeRebuild();
-    m_paste.cancel({});
-    m_pc1500.reset();
-    m_pc1600.reset();
+    discardMachine();
     makePC1600WithRomFallback();
-    attachSerialLink(*m_pc1600);
-    if (m_ce158SerialLink) m_pc1600->setCE158SerialLink(m_ce158SerialLink.get()); // see resetBareForPresetPC1500
+    wireNewMachine(); // see resetBareForPresetPC1500
     return *m_pc1600;
 }
 
@@ -217,7 +202,8 @@ void MachineController::attachSerialLink(PC1600Machine& machine) {
 void MachineController::refreshSerialLinkDirectory() {
     const std::string dir = effectiveSerialLinkDir().toStdString();
     if (m_serialLink) m_serialLink->relink(dir);
-    if (m_ce158SerialLink) m_ce158SerialLink->relink(dir);
+    if (PtySerialLink* ce158 = m_ce158SerialLink.link()) ce158->relink(dir);
+    emit serialLinksMoved();
 }
 
 QString MachineController::serialLinkStatus() const {
@@ -226,64 +212,34 @@ QString MachineController::serialLinkStatus() const {
 }
 
 QString MachineController::ce158SerialLinkStatus() const {
-    if (!m_ce158SerialLink || !m_ce158SerialLink->isOpen()) return QString();
-    return QString::fromStdString(m_ce158SerialLink->preferredPath());
+    const PtySerialLink* link = m_ce158SerialLink.link();
+    if (!link || !link->isOpen()) return QString();
+    return QString::fromStdString(link->preferredPath());
 }
 
-void MachineController::syncCE158SerialLink() {
-    if (!ce158Attached()) return;
-    if (!m_ce158SerialLink) {
-        m_ce158SerialLink = std::make_unique<PtySerialLink>(effectiveSerialLinkDir().toStdString(),
-                                                            PtySerialLink::kCE158LinkName);
-    }
-    if (m_pc1600) m_pc1600->setCE158SerialLink(m_ce158SerialLink.get());
-    else if (m_pc1500) m_pc1500->setCE158SerialLink(m_ce158SerialLink.get());
+void MachineController::wireNewMachine() {
+    withMachine([this](auto& machine) { machine.setCE158SerialLink(&m_ce158SerialLink); });
+    if (m_pc1600) attachSerialLink(*m_pc1600);
+    if (m_debug) m_debug->machineReplaced();
 }
 
 void MachineController::finishPresetLoad(Model model) {
     m_model = model;
-    seedClockFromHost();
     AppSettings::setLastUsedModel(static_cast<int>(m_model));
     emit modelChanged(m_model);
 }
 
 void MachineController::seedClockFromHost() {
-    seedClockFromHostNow();
-    m_clockResyncPending = true;
-}
-
-bool MachineController::resyncClockIfSeeded() {
-    if (!m_clockResyncPending) return false;
-    m_clockResyncPending = false;
-    seedClockFromHostNow();
-    return true;
-}
-
-void MachineController::seedClockFromHostNow() {
-    if (m_pc1600) seedClockFromHostTime(*m_pc1600);
-    else if (m_pc1500) seedClockFromHostTime(*m_pc1500);
+    withMachine([](auto& machine) { seedClockFromHostTime(machine); });
 }
 
 void MachineController::resetToPrompt(bool allReset) {
     cancelPaste();
-    if (m_pc1600) {
-        if (allReset) {
-            m_pc1600->allReset();
-        } else {
-            m_pc1600->reset();
-        }
-        runBootToPrompt(*m_pc1600);
-    } else if (m_pc1500) {
-        if (allReset) {
-            m_pc1500->allReset();
-        } else {
-            m_pc1500->reset();
-        }
-        runBootToPrompt(*m_pc1500);
-    }
-    // After the boot, not before: it ran flat out through seconds of
-    // emulated time the clock would otherwise run ahead by.
-    seedClockFromHost();
+    withMachine([allReset](auto& machine) {
+        if (allReset) machine.allReset();
+        else machine.reset();
+        runBootToPrompt(machine);
+    });
 }
 
 namespace {
@@ -302,7 +258,7 @@ void MachineController::powerCycleAround(const std::function<void()>& change) {
     }
     cancelPaste();
     const auto frame = static_cast<std::uint64_t>(clockHz() / 60);
-    auto cycle = [&](auto& machine) {
+    withMachine([&](auto& machine) {
         machine.pressKey("off");
         machine.runCycles(frame * kKeyHoldFrames);
         machine.releaseKey("off");
@@ -312,36 +268,19 @@ void MachineController::powerCycleAround(const std::function<void()>& change) {
         machine.runCycles(frame * kKeyHoldFrames);
         machine.setOnKeyPressed(false);
         runBootToPrompt(machine);
-    };
-    if (m_pc1600) cycle(*m_pc1600);
-    else if (m_pc1500) cycle(*m_pc1500);
-    // After the run, not before: it went flat out through seconds of emulated
-    // time the clock would otherwise run ahead by.
-    seedClockFromHost();
+    });
 }
 
 void MachineController::pressKey(const std::string& name) {
-    if (m_pc1600) {
-        m_pc1600->pressKey(name);
-    } else if (m_pc1500) {
-        m_pc1500->pressKey(name);
-    }
+    withMachine([&](auto& machine) { machine.pressKey(name); });
 }
 
 void MachineController::releaseKey(const std::string& name) {
-    if (m_pc1600) {
-        m_pc1600->releaseKey(name);
-    } else if (m_pc1500) {
-        m_pc1500->releaseKey(name);
-    }
+    withMachine([&](auto& machine) { machine.releaseKey(name); });
 }
 
 void MachineController::setOnKeyPressed(bool pressed) {
-    if (m_pc1600) {
-        m_pc1600->setOnKeyPressed(pressed);
-    } else if (m_pc1500) {
-        m_pc1500->setOnKeyPressed(pressed);
-    }
+    withMachine([&](auto& machine) { machine.setOnKeyPressed(pressed); });
 }
 
 void MachineController::tapShiftedKey(const std::string& baseName) {
@@ -375,20 +314,38 @@ void MachineController::enqueueShiftedKey(const std::string& baseName) {
     enqueueKey(baseName);
 }
 
-void MachineController::pasteText(const std::string& text) {
+void MachineController::pasteText(const std::string& text) { enqueueTyped(text, /*pressEnter=*/false); }
+
+void MachineController::typeCommand(const std::string& line) { enqueueTyped(line, /*pressEnter=*/true); }
+
+void MachineController::enqueueTyped(const std::string& text, bool pressEnter) {
     if (!m_pc1500 && !m_pc1600) return;
     if (!m_paste.active()) m_pasteFrameCycles = 0;
-    if (m_pc1600) {
-        m_paste.setPacing(pc1600PastePacing());
-        m_paste.append(buildPasteSteps(text, pc1600ResolveTypedChar));
-    } else {
-        m_paste.setPacing(pc1500PastePacing());
-        m_paste.append(buildPasteSteps(text, pc1500ResolveTypedChar));
-    }
+    std::vector<PasteStep> steps =
+        m_pc1600 ? buildPasteSteps(text, pc1600ResolveTypedChar, pc1600ResolveKbiiChar)
+                 : buildPasteSteps(text, pc1500ResolveTypedChar);
+    if (pressEnter) steps.push_back(PasteStep{"enter", false});
+    m_paste.setPacing(m_pc1600 ? pc1600PastePacing() : pc1500PastePacing());
+    m_paste.append(steps);
+    m_liveTyping = false;
+}
+
+void MachineController::typeLiveStep(const PasteStep& step) {
+    if (!m_pc1600) return;
+    if (!m_paste.active()) m_pasteFrameCycles = 0;
+    m_paste.setPacing(pc1600PastePacing());
+    m_paste.append({step});
+    m_liveTyping = true;
 }
 
 void MachineController::cancelPaste() {
     m_paste.cancel([this](const std::string& key) { releaseKey(key); });
+    m_liveTyping = false;
+}
+
+void MachineController::interruptPaste() {
+    m_paste.cancel([this](const std::string& key) { releaseKey(key); }, /*finishKbii=*/true);
+    m_liveTyping = m_paste.active(); // what's left is a KBII sequence's closing tap
 }
 
 GrayImage MachineController::currentScreenImage() const {
@@ -398,16 +355,21 @@ GrayImage MachineController::currentScreenImage() const {
 }
 
 void MachineController::runActive(std::uint64_t cycles) {
-    if (m_pc1600) {
-        m_pc1600->runCycles(cycles);
-    } else if (m_pc1500) {
-        m_pc1500->runCycles(cycles);
+    // With a debugger attached, the frame's budget goes through its run
+    // control (pause, stepping, breakpoints).
+    if (m_debug && m_debug->attached()) {
+        m_debug->runSlice(cycles);
+        return;
     }
+    withMachine([&](auto& machine) { machine.runCycles(cycles); });
 }
+
+void MachineController::refreshDebugServer() { m_debug->refreshServer(); }
 
 void MachineController::pasteOnFrame() {
     m_paste.onFrame([this](const std::string& key) { pressKey(key); },
-                    [this](const std::string& key) { releaseKey(key); });
+                    [this](const std::string& key) { releaseKey(key); },
+                    [this] { return m_pc1600 ? pc1600ReadLatches(*m_pc1600) : KeyLatches{}; });
 }
 
 void MachineController::advance(std::uint64_t cyclesBudget) {
@@ -429,14 +391,11 @@ void MachineController::advance(std::uint64_t cyclesBudget) {
 }
 
 std::size_t MachineController::drainAudio(std::int16_t* out, std::size_t max) {
-    if (m_pc1600) return m_pc1600->drainAudio(out, max);
-    if (m_pc1500) return m_pc1500->drainAudio(out, max);
-    return 0;
+    return withMachine(std::size_t{0}, [&](auto& machine) { return machine.drainAudio(out, max); });
 }
 
 void MachineController::discardAudio() {
-    if (m_pc1600) m_pc1600->discardAudio();
-    else if (m_pc1500) m_pc1500->discardAudio();
+    withMachine([](auto& machine) { machine.discardAudio(); });
 }
 
 double MachineController::clockHz() const {
@@ -461,9 +420,10 @@ DisplayFrame MachineController::currentDisplay() const {
         frame.poweredOn = snap.clockEnabled;
 
         static const char* kSymbolNames[] = {
-            "BUSY", "SHIFT", "S", "KBII", "SMALL", "DEG", "RAD", "GRAD",
+            "BUSY", "SHIFT", "S", "ROMAJI", "KANA", "SMALL", "DEG", "RAD", "GRAD",
             "RUN", "PRO", "RESERVE", "DEF", "I", "II", "III", "CTRL", "BATT",
         };
+        static_assert(std::size(kSymbolNames) == PC1600StatusLine::kCount, "one name per PC1600StatusLine::Symbol");
         for (std::size_t i = 0; i < PC1600StatusLine::kCount; ++i) {
             frame.statusSymbols.emplace_back(kSymbolNames[i], snap.statusSymbols[i]);
         }
@@ -495,9 +455,7 @@ DisplayFrame MachineController::currentDisplay() const {
 // ---- Debug panel support ----
 
 std::uint8_t MachineController::debugPeek(std::uint16_t addr) const {
-    if (m_pc1600) return m_pc1600->debugPeek(addr);
-    if (m_pc1500) return m_pc1500->debugPeek(addr);
-    return 0;
+    return withMachine(std::uint8_t{0}, [&](auto& machine) { return machine.debugPeek(addr); });
 }
 
 bool MachineController::debugSlotResponds(std::uint16_t addr) const {
@@ -573,29 +531,36 @@ DebugBankStateFrame MachineController::debugBankStatePC1600() const {
 }
 
 bool MachineController::beginTrace(const QString& path) {
-    if (!m_pc1500 && !m_pc1600) return false;
-    std::FILE* handle = std::fopen(path.toStdString().c_str(), "wb");
-    if (!handle) return false;
-    const bool ok = m_pc1600 ? m_pc1600->beginCpuTrace(handle, TRACE_FULL) : m_pc1500->beginCpuTrace(handle, TRACE_FULL);
-    if (!ok) std::fclose(handle); // a capture was already active; ownership passes only on success
-    return ok;
+    return withMachine(false, [&](auto& machine) {
+        std::FILE* handle = std::fopen(path.toStdString().c_str(), "wb");
+        if (!handle) return false;
+        const bool ok = machine.beginCpuTrace(handle, TRACE_FULL);
+        if (!ok) std::fclose(handle); // a capture was already active; ownership passes only on success
+        return ok;
+    });
 }
 
 void MachineController::endTrace() {
-    if (m_pc1600) m_pc1600->endCpuTrace();
-    else if (m_pc1500) m_pc1500->endCpuTrace();
+    withMachine([](auto& machine) { machine.endCpuTrace(); });
+}
+
+std::uint64_t MachineController::traceBytes() const {
+    return withMachine(std::uint64_t{0}, [](auto& machine) { return machine.cpuTraceBytes(); });
 }
 
 bool MachineController::traceActive() const {
-    if (m_pc1600) return m_pc1600->cpuTraceActive();
-    return m_pc1500 && m_pc1500->cpuTraceActive();
+    return withMachine(false, [](auto& machine) { return machine.cpuTraceActive(); });
 }
 
-void MachineController::endTraceBeforeRebuild() {
-    if (!traceActive()) return;
+void MachineController::discardMachine() {
+    if (m_debug) m_debug->machineAboutToChange();
     endTrace();
-    emit traceEndedByRebuild();
+    m_paste.cancel({}); // the machine it was typing into is going away
+    m_liveTyping = false;
+    m_pc1500.reset();
+    m_pc1600.reset();
 }
+
 
 // ---- Plotter support ----
 
@@ -604,59 +569,43 @@ void MachineController::flushFloppyBeforeDetach() {
 }
 
 bool MachineController::attachCE150(QString* error) {
+    flushFloppyBeforeDetach(); // on a PC-1600, Core detaches the CE-1600P/F to make room
     std::string err;
-    bool ok = false;
-    if (m_pc1600) {
-        flushFloppyBeforeDetach();  // Core detaches the CE-1600P/F to make room
-        ok = BundledRoms::attachCE150(*m_pc1600, bundledRomDirs(), &err);
-    } else if (m_pc1500) {
-        ok = BundledRoms::attachCE150(*m_pc1500, bundledRomDirs(), &err);
-    }
+    const bool ok = withMachine(false, [&](auto& machine) {
+        return BundledRoms::attachCE150(machine, bundledRomDirs(), &err);
+    });
     if (!ok && error) *error = QString::fromStdString(err);
     return ok;
 }
 
 void MachineController::detachCE150() {
-    if (m_pc1600) m_pc1600->detachCE150();
-    else if (m_pc1500) m_pc1500->detachCE150();
+    withMachine([](auto& machine) { machine.detachCE150(); });
 }
 
 bool MachineController::ce150Attached() const {
-    if (m_pc1600) return m_pc1600->ce150Attached();
-    if (m_pc1500) return m_pc1500->ce150Attached();
-    return false;
+    return withMachine(false, [](auto& machine) { return machine.ce150Attached(); });
 }
 
 bool MachineController::attachCE158(QString* error) {
+    flushFloppyBeforeDetach(); // on a PC-1600, Core detaches the CE-1600P/F to make room
     std::string err;
-    bool ok = false;
-    if (m_pc1600) {
-        flushFloppyBeforeDetach(); // Core detaches the CE-1600P/F to make room
-        ok = BundledRoms::attachCE158(*m_pc1600, bundledRomDirs(), &err);
-    } else if (m_pc1500) {
-        ok = BundledRoms::attachCE158(*m_pc1500, bundledRomDirs(), &err);
-    }
-    if (!ok) {
-        if (error) *error = QString::fromStdString(err);
-        return false;
-    }
-    syncCE158SerialLink();
-    return true;
+    const bool ok = withMachine(false, [&](auto& machine) {
+        return BundledRoms::attachCE158(machine, bundledRomDirs(), &err);
+    });
+    if (!ok && error) *error = QString::fromStdString(err);
+    return ok;
 }
 
 void MachineController::detachCE158() {
-    if (m_pc1600) m_pc1600->detachCE158();
-    else if (m_pc1500) m_pc1500->detachCE158();
+    withMachine([](auto& machine) { machine.detachCE158(); });
 }
 
 bool MachineController::ce158Attached() const {
-    if (m_pc1600) return m_pc1600->ce158Attached();
-    return m_pc1500 && m_pc1500->ce158Attached();
+    return withMachine(false, [](auto& machine) { return machine.ce158Attached(); });
 }
 
 std::vector<std::uint8_t> MachineController::drainCE158PrinterOutput() {
-    if (m_pc1600) return m_pc1600->drainCE158ParallelOutput();
-    return m_pc1500 ? m_pc1500->drainCE158ParallelOutput() : std::vector<std::uint8_t>{};
+    return withMachine(std::vector<std::uint8_t>{}, [](auto& machine) { return machine.drainCE158ParallelOutput(); });
 }
 
 bool MachineController::attachCE1600P(QString* error) {
@@ -692,25 +641,57 @@ void MachineController::detachCE1600P() {
     m_pc1600->detachCE1600P();
 }
 
+bool MachineController::attachHostDrive(const QString& dir, QString* error) {
+    if (!m_pc1600) return false;
+    const std::filesystem::path path = std::filesystem::u8path(dir.toStdString());
+    if (m_pc1600->hostDriveAttached()) {
+        m_pc1600->setHostDriveDirectory(path);
+    } else {
+        std::string err;
+        if (!BundledRoms::attachHostDrive(*m_pc1600, bundledRomDirs(), path, &err)) {
+            if (error) *error = QString::fromStdString(err);
+            return false;
+        }
+    }
+    return true;
+}
+
+QString MachineController::hostDriveDirectory() const {
+    return m_pc1600 ? QString::fromStdString(m_pc1600->hostDriveDirectory().u8string()) : QString();
+}
+
+void MachineController::detachHostDrive() {
+    if (m_pc1600) m_pc1600->detachHostDrive();
+}
+
+bool MachineController::hostDriveAttached() const {
+    return m_pc1600 && m_pc1600->hostDriveAttached();
+}
+
+bool MachineController::swapCE1600PRom(CE1600PRomVersion version, QString* error) {
+    const int side = m_pc1600 ? m_pc1600->ce1600fSide() : 0;
+    detachCE1600P();
+    setCE1600PRomVersion(version);
+    if (!attachCE1600P(error)) return false; // re-inserts the selected disk, side A up
+    if (side != 0 && m_pc1600->ce1600fHasDisk()) m_pc1600->ce1600fSetSide(side);
+    return true;
+}
+
 bool MachineController::ce1600pAttached() const {
     return m_pc1600 && m_pc1600->ce1600pAttached();
 }
 
 std::vector<AlpsPlotterMechanism::FlatPoint> MachineController::ce150PlotPoints() const {
-    if (m_pc1600) return m_pc1600->ce150PlotPoints();
-    if (m_pc1500) return m_pc1500->ce150PlotPoints();
-    return {};
+    return withMachine(std::vector<AlpsPlotterMechanism::FlatPoint>{},
+                       [](auto& machine) { return machine.ce150PlotPoints(); });
 }
 
 std::uint64_t MachineController::ce150PlotRevision() const {
-    if (m_pc1600) return m_pc1600->ce150PlotRevision();
-    if (m_pc1500) return m_pc1500->ce150PlotRevision();
-    return 0;
+    return withMachine(std::uint64_t{0}, [](auto& machine) { return machine.ce150PlotRevision(); });
 }
 
 void MachineController::clearCE150Paper() {
-    if (m_pc1600) m_pc1600->clearCE150Paper();
-    else if (m_pc1500) m_pc1500->clearCE150Paper();
+    withMachine([](auto& machine) { machine.clearCE150Paper(); });
 }
 
 std::vector<AlpsPlotterMechanism::FlatPoint> MachineController::ce1600pPlotPoints() const {
@@ -726,7 +707,7 @@ void MachineController::clearCE1600PPaper() {
 }
 
 bool MachineController::isMachinePoweredOn() const {
-    if (m_pc1600) return m_pc1600->sc7852Owns();
+    if (m_pc1600) return !m_pc1600->isPoweredOff();
     if (m_pc1500) return !m_pc1500->cpu().poweredOff();
     return false;
 }

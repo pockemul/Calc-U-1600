@@ -52,8 +52,11 @@ void PC1600Memory::reset() {
     // Interrupt cause/mask start clear; the boot ROM programs 35H itself.
     m_intCause = 0;
     m_intMask = 0;
-    updateIntLine();
     m_uart.reset();
+    // Port 37H bit 4 (CK0, the LCD base clock) is 0 after reset until the
+    // boot ROM enables it. The LCD controllers themselves are not reset:
+    // VGG keeps their RAM and registers.
+    m_display.setClockEnabled(false);
     // Port-block reset: modulation off, SDO back to its idle level.
     m_fReg = 0;
     m_sdo = true;
@@ -108,10 +111,9 @@ const uint8_t* PC1600Memory::resolveConst(uint16_t addr) const {
         // banks 1/2: genuinely open bus, not just unresearched -- CS24
         // alone decodes this whole window into internal ROM only, no
         // memory-slot connector pin is ever asserted here (see class
-        // comment). bank 6: no documented content in this window. banks
-        // 4/5 (CE-1600P): real peripheral ROM, deferred until CE-1600P
-        // exists. bank 7: see Page C's bank 7 comment below (same global
-        // "confirmed unused" bank number, different window).
+        // comment). banks 4-7: no internal content; read() hands them to
+        // the 60-pin system bus (4/5 CE-1600P, 7 the host-directory drive
+        // -- the MEP module's bank on real hardware; 6 has no known card).
         return nullptr;
     }
     if (addr < 0xC000) {
@@ -246,12 +248,14 @@ uint8_t PC1600Memory::read(uint16_t addr) const {
     }
     if (const uint8_t* p = resolveConst(addr)) return trace(*p, 1);
     if (addr >= 0x4000 && addr < 0x8000) {
-        // Page B banks 4/5: CE-1600P ROM, card-backed via the 60-pin system
-        // bus -- see PC1600Memory.hpp's class comment and ce1600pBus().
+        // Page B banks 4-7: peripheral ROM on the 60-pin system bus -- 4/5
+        // CE-1600P, 7 the host-directory drive (where the MEP module sits
+        // on real hardware) -- see PC1600Memory.hpp's class comment and
+        // ce1600pBus().
         const uint8_t bank = m_bank.pageBBank();
-        if (bank == 4 || bank == 5) {
+        if (bank >= 4) {
             uint8_t v;
-            if (m_ce1600pBus.readRom(static_cast<uint16_t>(addr - 0x4000), bank == 5, v))
+            if (m_ce1600pBus.readRom(static_cast<uint16_t>(addr - 0x4000), bank, v))
                 return trace(v, 6);
         }
     }
@@ -263,7 +267,7 @@ uint8_t PC1600Memory::read(uint16_t addr) const {
     return trace(0xFF, 4); // open bus
 }
 
-void PC1600Memory::writeImpl(uint16_t addr, uint8_t value, bool direct) {
+bool PC1600Memory::writeImpl(uint16_t addr, uint8_t value, bool direct) {
 #ifdef PC1600_POWER_PROBE
     const auto traceW = [&](int claimed) {
         pc1600probe::onSlotWrite(addr, value, claimed, m_bank.readPort31(),
@@ -273,21 +277,26 @@ void PC1600Memory::writeImpl(uint16_t addr, uint8_t value, bool direct) {
     const auto traceW = [](int) {};
 #endif
     const SlotRemap r = resolveSlotRemap(addr);
-    if (r.hit1 && m_slot1Conn.writeRemapped(r.off1, r.pvoutHigh1, value, direct)) {
-        traceW(5);
-        return;
+    if (r.hit1) {
+        if (const WriteResult w = m_slot1Conn.writeRemapped(r.off1, r.pvoutHigh1, value, direct)) {
+            traceW(5);
+            return w.stored;
+        }
     }
-    if (r.hit2 && m_slot2Conn.writeRemapped(r.off2, r.pvoutHigh2, value, direct)) {
-        traceW(0);
-        return;
+    if (r.hit2) {
+        if (const WriteResult w = m_slot2Conn.writeRemapped(r.off2, r.pvoutHigh2, value, direct)) {
+            traceW(0);
+            return w.stored;
+        }
     }
-    if (isRom(addr)) { traceW(1); return; } // ROM / unbacked: ignored
-    if (uint8_t* p = resolveMutable(addr)) { *p = value; traceW(1); return; }
+    if (isRom(addr)) { traceW(1); return false; } // ROM / unbacked: ignored
+    if (uint8_t* p = resolveMutable(addr)) { *p = value; traceW(1); return true; }
     if (isSlotWindow(addr)) {
-        if (m_slot1Conn.write(addr, value, direct)) { traceW(2); return; }
-        if (m_slot2Conn.write(addr, value, direct)) { traceW(3); return; }
+        if (const WriteResult w = m_slot1Conn.write(addr, value, direct)) { traceW(2); return w.stored; }
+        if (const WriteResult w = m_slot2Conn.write(addr, value, direct)) { traceW(3); return w.stored; }
     }
     traceW(4); // open bus / unattached slot: nothing to write
+    return false;
 }
 
 uint8_t PC1600Memory::readIO(uint8_t port) {
@@ -299,18 +308,18 @@ uint8_t PC1600Memory::readIO(uint8_t port) {
 uint8_t PC1600Memory::readIOImpl(uint8_t port) {
 #endif
     if (port >= 0x50 && port <= 0x5B) return m_display.readIO(port);
-    // CE-1600P/CE-1600F (60-pin system bus): ports 0x70-0x8F -- 0x70-0x7F
-    // (CE1600FCard: command/sector/motor/data registers) and 0x80-0x8F
-    // (CE1600PCard: 0x81 pen-at-home status today). Open bus (0xFF) when
-    // unattached or when no card on the bus claims a given port, same
-    // convention as the rest of this function.
-    if (port >= 0x70 && port <= 0x8F) {
+    // 60-pin system bus: ports 0x70-0x9F -- 0x70-0x7F (CE1600FCard:
+    // command/sector/motor/data registers), 0x80-0x8F (CE1600PCard: 0x81
+    // pen-at-home status today) and 0x90-0x9F (PC1600HostDriveCard). Open
+    // bus (0xFF) when unattached or when no card on the bus claims a given
+    // port, same convention as the rest of this function.
+    if (port >= 0x70 && port <= 0x9F) {
         uint8_t v;
         return m_ce1600pBus.readIO(port, v) ? v : 0xFF;
     }
     switch (port) {
         case 0x31: return m_bank.readPort31();
-        case 0x32: { uint8_t v = intCause(); m_intCause = 0; updateIntLine(); return v; } // read-clears, see latchTimer64InterruptCause()'s own comment
+        case 0x32: { uint8_t v = intCause(); m_intCause = 0; return v; } // read-clears, see latchTimer64InterruptCause()'s own comment
         // 33H (IOR P) = the sub-CPU's answer register; 21H's write side is
         // the matching command port. See PC1600SubCpu's class comment.
         case 0x33: return m_subCpu.readAnswer();
@@ -364,10 +373,11 @@ void PC1600Memory::writeIO(uint8_t port, uint8_t value) {
     pc1600probe::onIoWrite(port, value);
 #endif
     if (port >= 0x50 && port <= 0x5B) { m_display.writeIO(port, value); return; }
-    // CE-1600P/CE-1600F (60-pin system bus): ports 0x70-0x8F -- 0x70-0x7F
-    // (CE1600FCard registers) and 0x80-0x8F (0x81 FD reset, 0x82 Z-motor,
-    // 0x83 X/Y-motor; see CE1600PCard/CE1600FCard). No-op when unattached.
-    if (port >= 0x70 && port <= 0x8F) { m_ce1600pBus.writeIO(port, value); return; }
+    // 60-pin system bus: ports 0x70-0x9F -- 0x70-0x7F (CE1600FCard
+    // registers), 0x80-0x8F (0x81 FD reset, 0x82 Z-motor, 0x83 X/Y-motor;
+    // see CE1600PCard/CE1600FCard) and 0x90-0x9F (PC1600HostDriveCard).
+    // No-op when unattached.
+    if (port >= 0x70 && port <= 0x9F) { m_ce1600pBus.writeIO(port, value); return; }
     // Slot-2 I/O range (28-2FH, PC-1600 TRM §9): a module whose bank latch
     // triggers on a port write (CE-1601M: OUT (28H) sampling the data bus)
     // sees it here -- the card now owns that decode. The mainboard's own
@@ -391,7 +401,7 @@ void PC1600Memory::writeIO(uint8_t port, uint8_t value) {
         // authoritative b5:b4 from this latch.
         case 0x3C: m_bank.writePort3C(value); return;
         case 0x3D: m_bank.writePort3D(value); return;
-        case 0x35: m_intMask = value; updateIntLine(); return;
+        case 0x35: m_intMask = value; return;
         case 0x39: m_im2VectorLow = value; if (m_cpu) m_cpu->setIM2VectorByte(value); return;
         case 0x38: if (m_arbiter) m_arbiter->requestSwitchFromSC7852(); return;
         case 0x18:
